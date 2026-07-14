@@ -1,0 +1,43 @@
+self.speak
+Copyright (C) 2026 selfdothost / the self.ai contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License version 3, as published by the Free
+Software Foundation. The full text is in LICENSE.
+
+--------------------------------------------------------------------------------
+Provenance & retained upstream notice
+--------------------------------------------------------------------------------
+
+self.speak is a fork of Remsky's Kokoro-FastAPI
+(https://github.com/remsky/Kokoro-FastAPI), originally licensed Apache-2.0, at
+version 0.3.0. Unlike self.faster-whisper's earlier pattern of vendoring an
+importable Python package, Kokoro-FastAPI has no library surface to rename --
+it is a FastAPI application (api/src/) that *depends on* (via pip, not
+vendored source) hexgrad's `kokoro` and `misaki` packages and the
+`hexgrad/Kokoro-82M` model weights, all separately licensed Apache-2.0. The
+application code under api/, web/, and docker/ is what's forked and renamed
+here; the pip dependencies and downloaded model weights are unmodified
+third-party components used as-is.
+
+The fork point is pinned in our history at upstream commit
+`3af45718888ba1feb31a0f26b3373a4d7ee1e30e` ("Merge pull request #398 from
+sahlex/fix-397"), the last Kokoro-FastAPI commit before self.ai-specific work
+began. The full upstream git history is preserved verbatim in this repo's
+history -- nothing was squashed.
+
+Why GPLv3 here: self.ai licenses the combined work under GPLv3. Apache-2.0 is
+one-way compatible with GPLv3 (the FSF and Apache Software Foundation both
+recognize this combination as permitted, per Apache-2.0 section 4 and the
+GPLv3 Apache-2.0-compatibility exception in GPLv3's own text), so the
+upstream code is included here under GPLv3 while its original Apache-2.0
+license text and attribution are retained verbatim in
+LICENSE.kokoro-fastapi-apache. A GPLv3 combined work cannot be contributed
+back to an Apache-2.0 upstream, so self.speak does not track or push to the
+original project. self.speak is not affiliated with, endorsed by, or
+connected to Remsky (Kokoro-FastAPI) or hexgrad (kokoro/misaki/Kokoro-82M).
+
+The original Apache-2.0 license text is preserved verbatim in
+LICENSE.kokoro-fastapi-apache. Kokoro-FastAPI's own upstream distribution
+included no NOTICE file of its own to propagate; this file is self.speak's
+own attribution notice per Apache-2.0 section 4(d).

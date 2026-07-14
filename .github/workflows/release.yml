@@ -1,0 +1,192 @@
+name: Create Release and Publish Docker Images
+
+on:
+  push:
+    branches:
+      - release # Auto-trigger only on release branch
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch: # Manual trigger - explicitly specify branch
+    inputs:
+      branch_name:
+        description: 'Branch to build from (required)'
+        required: true
+        type: string
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      version_tag: ${{ steps.get-version.outputs.version_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get version from VERSION file
+        id: get-version
+        run: |
+          VERSION_PLAIN=$(cat VERSION)
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            BRANCH_NAME="${{ inputs.branch_name }}"
+          else
+            BRANCH_NAME="${{ github.ref_name }}"
+          fi
+
+          if [[ "$BRANCH_NAME" == "release" ]]; then
+            echo "version=${VERSION_PLAIN}" >> $GITHUB_OUTPUT
+            echo "version_tag=v${VERSION_PLAIN}" >> $GITHUB_OUTPUT
+          else
+            SAFE_BRANCH=$(echo "$BRANCH_NAME" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+            echo "version=${VERSION_PLAIN}-${SAFE_BRANCH}" >> $GITHUB_OUTPUT
+            echo "version_tag=v${VERSION_PLAIN}-${SAFE_BRANCH}" >> $GITHUB_OUTPUT
+          fi
+
+  build-images:
+    needs: prepare-release
+    permissions:
+      packages: write
+    env:
+      DOCKER_BUILDKIT: 1
+      BUILDKIT_STEP_LOG_MAX_SIZE: 10485760
+      VERSION: ${{ needs.prepare-release.outputs.version_tag }}
+      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
+      OWNER: ${{ vars.OWNER || 'remsky' }}
+      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
+    strategy:
+      matrix:
+        include:
+          - build_target: "cpu"
+            platform: "linux/amd64"
+            runs_on: "ubuntu-latest"
+          - build_target: "gpu"
+            platform: "linux/amd64"
+            runs_on: "ubuntu-latest"
+          - build_target: "cpu"
+            platform: "linux/arm64"
+            runs_on: "ubuntu-24.04-arm"
+          - build_target: "gpu"
+            platform: "linux/arm64"
+            runs_on: "ubuntu-24.04-arm"
+          - build_target: "rocm"
+            platform: "linux/amd64"
+            runs_on: "ubuntu-latest"
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Needed to check for existing tags
+
+      - name: Check if tag already exists
+        run: |
+          TAG_NAME="${{ needs.prepare-release.outputs.version_tag }}"
+          echo "Checking for existing tag: $TAG_NAME"
+          git fetch --tags
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG_NAME already exists. Please increment the version in the VERSION file."
+            exit 1
+          else
+            echo "Tag $TAG_NAME does not exist. Proceeding with release."
+          fi
+
+      - name: Free disk space
+        run: |
+          echo "Listing current disk space"
+          df -h
+          echo "Cleaning up disk space..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          docker system prune -af
+          echo "Disk space after cleanup"
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3 # Use v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3 # Use v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push single-platform image
+        run: |
+          PLATFORM="${{ matrix.platform }}"
+          BUILD_TARGET="${{ matrix.build_target }}"
+          VERSION_TAG="${{ needs.prepare-release.outputs.version_tag }}"
+
+          echo "Building ${PLATFORM} image for ${BUILD_TARGET} version ${VERSION_TAG}"
+
+          TARGET="${BUILD_TARGET}-$(echo ${PLATFORM} | cut -d'/' -f2)"
+          echo "Using bake target: $TARGET"
+
+          docker buildx bake $TARGET --push --progress=plain
+
+  create-manifests:
+    needs: [prepare-release, build-images]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      REGISTRY: ${{ vars.REGISTRY || 'ghcr.io' }}
+      OWNER: ${{ vars.OWNER || 'remsky' }}
+      REPO: ${{ vars.REPO || 'kokoro-fastapi' }}
+    strategy:
+      matrix:
+        build_target: ["cpu", "gpu", "rocm"]
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-platform manifest
+        run: |
+          VERSION_TAG="${{ needs.prepare-release.outputs.version_tag }}"
+          TARGET="${{ matrix.build_target }}"
+          REGISTRY="${{ env.REGISTRY }}"
+          OWNER="${{ env.OWNER }}"
+          REPO="${{ env.REPO }}"
+
+          docker buildx imagetools create -t \
+            ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG} \
+            ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG}-amd64 \
+            ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG}-arm64
+
+          if [[ "$VERSION_TAG" != *"-"* ]]; then
+            docker buildx imagetools create -t \
+              ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:latest \
+              ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG}-amd64 \
+              ${REGISTRY}/${OWNER}/${REPO}-${TARGET}:${VERSION_TAG}-arm64
+          fi
+
+  create-release:
+    needs: [prepare-release, create-manifests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-release.outputs.version_tag }}
+          name: Release ${{ needs.prepare-release.outputs.version_tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

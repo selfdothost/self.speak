@@ -1,0 +1,89 @@
+# self.speak CI — yard-native image build.
+# kaniko on bigbuild -> container.home (same pattern as self.ai / self.chat /
+# self.transcribe). CPU image: model is baked in at build time (no PVC needed,
+# unlike self.transcribe's runtime HF download) via docker/cpu/Dockerfile.
+#
+# lint + test added from day one (unlike self.transcribe, which shipped with
+# build-only CI and needed a follow-up commit to add these).
+
+stages: [lint, test, build, publish]
+
+include:
+  - project: 'selfshipyard/selfai/self.ai'
+    ref: main
+    file: '.gitlab/ci-templates/sync-public-alpha.yml'
+
+default:
+  tags: [bigbuild]
+
+variables:
+  IMAGE: $CI_REGISTRY_IMAGE
+
+# --- publish: mirror main -> public-alpha (GitLab + GitHub), scheduled only -
+sync:public-alpha:
+  extends: .sync-public-alpha
+  variables:
+    MIRROR_EXCLUDE_PATHS: ""
+
+# --- lint: ruff (import-sort only -- this repo's own .ruff.toml scope) -----
+# tags: [yard] (not the top-level bigbuild default) -- this is a lightweight
+# python:slim job, no reason to queue behind the shared heavy-build runner.
+lint:ruff:
+  stage: lint
+  image: python:3.10-slim-bookworm
+  tags: [yard]
+  before_script:
+    - pip install --no-cache-dir ruff~=0.6.9
+  script:
+    - ruff check .
+
+# --- test: pytest against api/tests/ ----------------------------------------
+# System-deps + install recipe STARTED as a verbatim copy of this repo's own
+# upstream .github/workflows/ci.yml, but that recipe silently relies on
+# GitHub's ubuntu-latest runner image shipping build-essential (gcc/g++/make)
+# preinstalled -- true on GitHub Actions, NOT true on a bare python:slim
+# image. First run here failed building pyopenjtalk (misaki[ja] dependency,
+# needs cmake + a real C/C++ toolchain): "CMAKE_C_COMPILER not set" / "CMake
+# was unable to find a build program". build-essential added to fix.
+# allow_failure: true for the first run in GitLab CI since it's never run
+# here before (only ever run on GitHub Actions). tags: [yard], same reasoning
+# as lint:ruff above.
+test:pytest:
+  stage: test
+  image: python:3.10-slim-bookworm
+  tags: [yard]
+  timeout: 20m
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends
+        build-essential espeak-ng espeak-ng-data git libsndfile1 curl ffmpeg g++ cmake
+        && rm -rf /var/lib/apt/lists/*
+    - pip install --no-cache-dir uv
+    - uv pip install --system -e .[test,cpu]
+  script:
+    - python -m pytest api/tests/ --asyncio-mode=auto --cov=api --cov-report=term-missing
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+# --- build: CPU image (model baked in at build time) ------------------------
+build:self-speak:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  timeout: 1h
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+  script:
+    - >
+      /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile docker/cpu/Dockerfile
+      --cache=true --cache-repo "$IMAGE/cache"
+      --destination "$IMAGE:$CI_COMMIT_SHORT_SHA"
+      --destination "$IMAGE:latest"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
