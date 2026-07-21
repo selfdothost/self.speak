@@ -49,8 +49,16 @@ def test_clear_memory(mock_sync, mock_clear, kokoro_backend):
 
 @pytest.mark.asyncio
 async def test_load_model_validation(kokoro_backend):
-    """Test model loading validation."""
-    with pytest.raises(RuntimeError, match="Failed to load Kokoro model"):
+    """Test model loading validation.
+
+    A missing model file surfaces as an unwrapped FileNotFoundError (not
+    wrapped in RuntimeError) by design: KokoroV1.load_model() and
+    ModelManager.load_model() both special-case FileNotFoundError and
+    re-raise it as-is so that ModelManager.initialize_with_warmup() can
+    catch it distinctly and print download instructions instead of a
+    generic "Warmup failed" RuntimeError (see model_manager.py).
+    """
+    with pytest.raises(FileNotFoundError, match="File not found"):
         await kokoro_backend.load_model("nonexistent_model.pth")
 
 

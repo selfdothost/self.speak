@@ -45,9 +45,10 @@ lint:ruff:
 # image. First run here failed building pyopenjtalk (misaki[ja] dependency,
 # needs cmake + a real C/C++ toolchain): "CMAKE_C_COMPILER not set" / "CMake
 # was unable to find a build program". build-essential added to fix.
-# allow_failure: true for the first run in GitLab CI since it's never run
-# here before (only ever run on GitHub Actions). tags: [yard], same reasoning
-# as lint:ruff above.
+# allow_failure was true while this ran green-except-one (issue #1: 81
+# passed, 1 failed on the test/code mismatch in test_load_model_validation,
+# fixed in that issue). Flipped to false now that the suite is fully green.
+# tags: [yard], same reasoning as lint:ruff above.
 test:pytest:
   stage: test
   image: python:3.10-slim-bookworm
@@ -61,7 +62,7 @@ test:pytest:
     - uv pip install --system -e .[test,cpu]
   script:
     - python -m pytest api/tests/ --asyncio-mode=auto --cov=api --cov-report=term-missing
-  allow_failure: true
+  allow_failure: false
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main"'

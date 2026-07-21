@@ -19,8 +19,15 @@ from api.src.routers.openai_compatible import (
 from api.src.services.streaming_audio_writer import StreamingAudioWriter
 from api.src.services.tts_service import TTSService
 from api.src.structures.schemas import OpenAISpeechRequest
+from api.tests.conftest import mint_test_ticket
 
 client = TestClient(app)
+# create_speech (POST /v1/audio/speech) now requires a scoped X-Selfai-Ticket
+# (self.ai#25) -- attach a valid one to every request this client makes so
+# the TTS-behavior tests below exercise create_speech's actual logic rather
+# than 401ing on the auth dependency. Real scope/audience/expiry enforcement
+# is covered separately in test_ticket_auth.py.
+client.headers.update({"X-Selfai-Ticket": mint_test_ticket()})
 
 
 @pytest.fixture

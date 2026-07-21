@@ -13,6 +13,11 @@ dependencies = [
     "pydantic-settings==2.7.0",
     "python-dotenv==1.0.1",
     "sqlalchemy==2.0.27",
+    # Service-ticket auth (self.ai#25) -- validates the X-Selfai-Ticket JWT
+    # self.ai mints before calling /v1/audio/speech. Same pin as self.ai's
+    # api/requirements.txt and self.llamolotl's, so all three sides of the
+    # mesh agree on the library version.
+    "PyJWT[crypto]==2.13.0",
     # ML/DL Base
     "numpy>=1.26.0",
     "scipy==1.14.1",

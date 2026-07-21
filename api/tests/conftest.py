@@ -1,7 +1,22 @@
 import os
+
+# ---------------------------------------------------------------------------
+# Service-ticket auth (self.ai#25 / api/src/core/auth.py) -- SERVICE_AUTH_SECRET
+# is read once at import time by api.src.core.auth, so it must be set before
+# anything imports that module (transitively, via api.src.main ->
+# api.src.routers.openai_compatible -> ..core.auth below). Any non-empty
+# value works; test_ticket_auth.py exercises real validation against this
+# exact value, and the rest of this suite just needs create_speech's
+# require_scope("audio:synthesize") dependency to be satisfiable via a
+# minted ticket rather than 401ing every existing TTS-behavior test.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("SERVICE_AUTH_SECRET", "pytest-only-service-auth-secret")
+
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import jwt
 import numpy as np
 import pytest
 import pytest_asyncio
@@ -11,6 +26,35 @@ from api.src.inference.model_manager import ModelManager
 from api.src.inference.voice_manager import VoiceManager
 from api.src.services.tts_service import TTSService
 from api.src.structures.model_schemas import VoiceConfig
+
+# Test-only HMAC secret/audience for the service-ticket auth layer
+# (self.ai#25). Must match the SERVICE_AUTH_SECRET set above. Never used
+# outside pytest -- real deployments get SERVICE_AUTH_SECRET from the
+# selfai-service-auth ExternalSecret.
+TEST_SERVICE_AUTH_SECRET = os.environ["SERVICE_AUTH_SECRET"]
+TEST_SERVICE_AUTH_AUDIENCE = "self.speak"
+
+
+def mint_test_ticket(
+    scope="audio:synthesize",
+    audience=TEST_SERVICE_AUTH_AUDIENCE,
+    secret=TEST_SERVICE_AUTH_SECRET,
+    ttl_seconds=120,
+    **extra_claims,
+):
+    """Mint a service ticket signed with the pytest test secret. Mirrors
+    self.ai's minting side (routers/audio.py's mint_service_ticket calls)
+    closely enough to exercise the same validation path as production."""
+    now = int(time.time())
+    payload = {
+        "iss": "self.ai",
+        "aud": audience,
+        "scope": scope,
+        "iat": now,
+        "exp": now + ttl_seconds,
+    }
+    payload.update(extra_claims)
+    return jwt.encode(payload, secret, algorithm="HS256")
 
 
 @pytest.fixture
@@ -69,3 +113,13 @@ async def tts_service(mock_model_manager, mock_voice_manager):
 def test_voice():
     """Return a test voice name."""
     return "voice1"
+
+
+@pytest.fixture
+def valid_ticket_header():
+    """A ready-to-use X-Selfai-Ticket header dict, correctly scoped for
+    POST /v1/audio/speech. Use for tests exercising TTS behavior (not auth
+    itself) so create_speech's require_scope("audio:synthesize") dependency
+    doesn't 401 them -- real scope/audience/expiry enforcement is covered
+    separately in test_ticket_auth.py."""
+    return {"X-Selfai-Ticket": mint_test_ticket()}

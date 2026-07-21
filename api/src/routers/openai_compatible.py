@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
 
+from ..core.auth import require_scope
 from ..core.config import settings
 from ..inference.base import AudioChunk
 from ..services.audio import AudioService
@@ -176,6 +177,7 @@ async def create_speech(
     request: OpenAISpeechRequest,
     client_request: Request,
     x_raw_response: str = Header(None, alias="x-raw-response"),
+    _ticket_claims: dict = Depends(require_scope("audio:synthesize")),
 ):
     """OpenAI-compatible endpoint for text-to-speech"""
     # Validate model before processing request
