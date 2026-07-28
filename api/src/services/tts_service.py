@@ -17,6 +17,7 @@ from ..inference.base import AudioChunk
 from ..inference.kokoro_v1 import KokoroV1
 from ..inference.model_manager import get_manager as get_model_manager
 from ..inference.voice_manager import get_manager as get_voice_manager
+from ..inference.vram_lease import track_synthesis
 from ..structures.schemas import NormalizationOptions
 from .audio import AudioNormalizer, AudioService
 from .streaming_audio_writer import StreamingAudioWriter
@@ -267,11 +268,54 @@ class TTSService:
         normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
         return_timestamps: Optional[bool] = False,
     ) -> AsyncGenerator[AudioChunk, None]:
-        """Generate and stream audio chunks."""
+        """Generate and stream audio chunks.
+
+        Wraps the whole synthesis lifetime in ``track_synthesis()`` (cavekit
+        vram-lease-client R2-AC2) so a VRAM release-request can detect in-flight
+        synthesis and wait for it to drain before unloading the model. This is
+        the single choke-point through which the full-audio ``generate_audio``
+        path also flows, so every ``POST /v1/audio/speech`` — streaming or full
+        — is counted for its whole duration. The context manager's ``finally``
+        runs when this generator is exhausted OR closed (GeneratorExit), so the
+        counter is always decremented, even if the client disconnects mid-stream.
+        """
+        async with track_synthesis():
+            async for chunk in self._generate_audio_stream_impl(
+                text,
+                voice,
+                writer,
+                speed=speed,
+                output_format=output_format,
+                lang_code=lang_code,
+                volume_multiplier=volume_multiplier,
+                normalization_options=normalization_options,
+                return_timestamps=return_timestamps,
+            ):
+                yield chunk
+
+    async def _generate_audio_stream_impl(
+        self,
+        text: str,
+        voice: str,
+        writer: StreamingAudioWriter,
+        speed: float = 1.0,
+        output_format: str = "wav",
+        lang_code: Optional[str] = None,
+        volume_multiplier: Optional[float] = 1.0,
+        normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
+        return_timestamps: Optional[bool] = False,
+    ) -> AsyncGenerator[AudioChunk, None]:
+        """Generate and stream audio chunks (implementation)."""
         stream_normalizer = AudioNormalizer()
         chunk_index = 0
         current_offset = 0.0
         try:
+            # Lazily (re)load the model if a VRAM-lease release unloaded it —
+            # otherwise every synthesis after a release 500s "Backend not
+            # initialized" until pod restart. Within the track_synthesis() scope
+            # (the caller), so a concurrent release drain-waits for this reload.
+            await self.model_manager.ensure_loaded()
+
             # Get backend
             backend = self.model_manager.get_backend()
 

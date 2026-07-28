@@ -25,12 +25,23 @@ Scope taxonomy (mirror of self.ai's minting side in
 api/selfai_ui/utils/service_auth.py / routers/audio.py — keep both lists in
 sync):
   audio:synthesize  - POST /v1/audio/speech
+  system:read       - GET  /api/system/vram-state
+  system:write      - POST /api/system/vram-release
 
-self.speak has exactly one meaningful mutating endpoint, so this taxonomy
-is deliberately a single scope rather than an unused hierarchy (see the
-kit's R2 section, which also leaves the read-only /v1/audio/voices and
-/v1/models discovery endpoints unticketed for now — same posture as
-self.llamolotl's /health). /health stays unticketed too.
+The two `system:*` scopes are the VRAM-lease control plane
+(context/kits/cavekit-vram-lease-client.md — R1 VRAM state reporting,
+R2 release-request handling). Names are reused verbatim from self.llamolotl's
+taxonomy so one taxonomy covers both control planes; core already mints this
+pair for the self.llamolotl audience, so its minting side
+(api/selfai_ui/utils/service_auth.py) only needs to ADD audience `self.speak`
+to the same two scopes — an explicit two-sided coordination. The scope strings
+here MUST match core's minted strings byte-for-byte; keep both lists in sync.
+
+self.speak's synthesis surface has exactly one meaningful mutating endpoint,
+so that slice of the taxonomy is deliberately a single scope rather than an
+unused hierarchy (see the kit's R2 section, which also leaves the read-only
+/v1/audio/voices and /v1/models discovery endpoints unticketed for now — same
+posture as self.llamolotl's /health). /health stays unticketed too.
 
 NetworkPolicy-level pod-to-pod restriction is a complementary defense-in-
 depth layer, explicitly out of scope here (see self.llamolotl#12).
@@ -55,6 +66,13 @@ SERVICE_AUTH_AUDIENCE = os.environ.get("SERVICE_AUTH_AUDIENCE", "self.speak")
 SERVICE_AUTH_ALGORITHM = "HS256"
 
 TICKET_HEADER = "X-Selfai-Ticket"
+
+# Named scope constants so route decorators reference these rather than bare
+# strings (reduces typo-drift against the wire scope core mints). These are the
+# canonical wire strings — see the module docstring's scope taxonomy.
+SCOPE_AUDIO_SYNTHESIZE = "audio:synthesize"
+SCOPE_SYSTEM_READ = "system:read"
+SCOPE_SYSTEM_WRITE = "system:write"
 
 
 class TicketError(HTTPException):

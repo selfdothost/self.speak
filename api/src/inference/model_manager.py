@@ -1,5 +1,6 @@
 """Kokoro V1 model management."""
 
+import asyncio
 from typing import Optional
 
 from loguru import logger
@@ -26,6 +27,9 @@ class ModelManager:
         self._config = config or model_config
         self._backend: Optional[KokoroV1] = None  # Explicitly type as KokoroV1
         self._device: Optional[str] = None
+        # Serializes lazy (re)loads so concurrent requests arriving after an
+        # unload trigger at most ONE reload. See ensure_loaded().
+        self._reload_lock = asyncio.Lock()
 
     def _determine_device(self) -> str:
         """Determine device based on settings."""
@@ -97,6 +101,36 @@ Model files not found! You need to download the Kokoro V1 model:
             exit(0)
         except Exception as e:
             raise RuntimeError(f"Warmup failed: {e}")
+
+    async def ensure_loaded(self) -> None:
+        """Lazily (re)load the model if the backend is not resident.
+
+        The backend is loaded once at startup by ``initialize_with_warmup``, but
+        a VRAM-lease release (``unload_all()``, driven by self.ai's GPU broker
+        when another service needs the shared card) drops it to free VRAM. Without
+        this, the next synthesis after a release fails permanently with "Backend
+        not initialized" until the pod restarts — so the serving path calls this
+        first to transparently cold-reload (the accepted latency cost of having
+        yielded the VRAM; ~a few seconds while the model reloads).
+
+        No-op in the common case (backend already resident). The reload itself
+        skips the startup warmup synthesis — the real request that triggered it
+        IS the warmup. Serialized by ``_reload_lock`` with a double-check so a
+        burst of requests after a release causes exactly one reload; the drain
+        guard in the release path (it waits for in-flight synthesis to finish
+        before unloading) plus this lock keep unload and reload from racing.
+        """
+        if self._backend is not None:
+            return
+        async with self._reload_lock:
+            if self._backend is not None:  # another coroutine reloaded while we waited
+                return
+            logger.info(
+                "Backend not resident (cold start or post-VRAM-release) — reloading Kokoro"
+            )
+            await self.initialize()
+            await self.load_model(self._config.pytorch_kokoro_v1_file)
+            logger.info("Kokoro backend reloaded and ready")
 
     def get_backend(self) -> BaseModelBackend:
         """Get initialized backend.

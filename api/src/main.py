@@ -14,9 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from .core.config import settings
+from .routers.control import router as control_router
 from .routers.debug import router as debug_router
 from .routers.development import router as dev_router
 from .routers.openai_compatible import router as openai_router
+from .routers.system import router as system_router
 from .routers.web_player import router as web_router
 
 
@@ -134,6 +136,8 @@ if settings.cors_enabled:
 
 # Include routers
 app.include_router(openai_router, prefix="/v1")
+app.include_router(control_router)  # /api/* control surface for the self.ai UI voice catalog
+app.include_router(system_router)  # /api/system/* VRAM-lease control plane (cavekit-vram-lease-client)
 app.include_router(dev_router)  # Development endpoints
 app.include_router(debug_router)  # Debug endpoints
 if settings.enable_web_player:

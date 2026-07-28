@@ -1,10 +1,15 @@
 # self.speak CI — yard-native image build.
-# kaniko on bigbuild -> container.home (same pattern as self.ai / self.chat /
-# self.transcribe). CPU image: model is baked in at build time (no PVC needed,
-# unlike self.transcribe's runtime HF download) via docker/cpu/Dockerfile.
+# buildkit-rootless on bigbuild -> container.home (gitlab-profile#60 /
+# self.infrastructure#143). NOT kaniko: kaniko's writable layer always lands on
+# the node's containerd root and can't be redirected (OOM-ing tight nodes);
+# buildkit's state is a flag (`--root`) pointed at the /builds mount, rootless.
+# The kaniko-only memory workarounds (--compressed-caching / --single-snapshot)
+# that the GPU build needed against the torch+cu129 OOM are DROPPED — buildkit
+# streams layers and doesn't hit kaniko's in-memory-tar ceiling.
+# CPU image: model baked in at build time via docker/cpu/Dockerfile.
 #
-# lint + test added from day one (unlike self.transcribe, which shipped with
-# build-only CI and needed a follow-up commit to add these).
+# Two-job split (selfinfra/zlib reference): build:* is the gate (builds, NO
+# push); publish:* builds + pushes on main only.
 
 stages: [lint, test, build, publish]
 
@@ -18,6 +23,29 @@ default:
 
 variables:
   IMAGE: $CI_REGISTRY_IMAGE
+  BUILDKIT_IMAGE: "moby/buildkit:v0.31.2-rootless"   # pinned, not master
+  # Bursty CI jobs: SMALL requests so a job schedules even on a busy node, HIGH
+  # limits so it can burst when it actually runs. These jobs sit idle until
+  # triggered, need real CPU/RAM only briefly, and don't all run at once — so
+  # right-sizing the request (not the limit) is what lets k8s bin-pack them.
+  # Requires the runner to permit resource overwrites (self.infrastructure#173).
+  KUBERNETES_CPU_REQUEST: "250m"
+  KUBERNETES_CPU_LIMIT: "8"
+  KUBERNETES_MEMORY_REQUEST: "1Gi"
+  KUBERNETES_MEMORY_LIMIT: "16Gi"
+
+# Registry auth + buildkit state dir, both OUTSIDE the build context (a SIBLING
+# of $CI_PROJECT_DIR): the CI_JOB_TOKEN credential must never sit where a
+# `COPY . .` could bake it into the image (gitlab-profile#60 trap 3). --root
+# points build bytes at the /builds mount, off the node containerd root (#143).
+.buildkit-before: &buildkit-before
+  - export BK_SCRATCH="${CI_BUILDS_DIR:-/builds}/.buildkit"
+  - mkdir -p "$BK_SCRATCH" 2>/dev/null || export BK_SCRATCH="$(dirname "$CI_PROJECT_DIR")/.buildkit"
+  - mkdir -p "$BK_SCRATCH/state" "$BK_SCRATCH/docker"
+  - export DOCKER_CONFIG="$BK_SCRATCH/docker"
+  - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > "$DOCKER_CONFIG/config.json"
+  - chmod 600 "$DOCKER_CONFIG/config.json"
+  - export BUILDKITD_FLAGS="--oci-worker-no-process-sandbox --root $BK_SCRATCH/state"
 
 # --- publish: mirror main -> public-alpha (GitLab + GitHub), scheduled only -
 sync:public-alpha:
@@ -25,9 +53,7 @@ sync:public-alpha:
   variables:
     MIRROR_EXCLUDE_PATHS: ""
 
-# --- lint: ruff (import-sort only -- this repo's own .ruff.toml scope) -----
-# tags: [yard] (not the top-level bigbuild default) -- this is a lightweight
-# python:slim job, no reason to queue behind the shared heavy-build runner.
+# --- lint: ruff (import-sort only) — lightweight, on yard ---
 lint:ruff:
   stage: lint
   image: python:3.10-slim-bookworm
@@ -37,18 +63,7 @@ lint:ruff:
   script:
     - ruff check .
 
-# --- test: pytest against api/tests/ ----------------------------------------
-# System-deps + install recipe STARTED as a verbatim copy of this repo's own
-# upstream .github/workflows/ci.yml, but that recipe silently relies on
-# GitHub's ubuntu-latest runner image shipping build-essential (gcc/g++/make)
-# preinstalled -- true on GitHub Actions, NOT true on a bare python:slim
-# image. First run here failed building pyopenjtalk (misaki[ja] dependency,
-# needs cmake + a real C/C++ toolchain): "CMAKE_C_COMPILER not set" / "CMake
-# was unable to find a build program". build-essential added to fix.
-# allow_failure was true while this ran green-except-one (issue #1: 81
-# passed, 1 failed on the test/code mismatch in test_load_model_validation,
-# fixed in that issue). Flipped to false now that the suite is fully green.
-# tags: [yard], same reasoning as lint:ruff above.
+# --- test: pytest against api/tests/ — lightweight, on yard ---
 test:pytest:
   stage: test
   image: python:3.10-slim-bookworm
@@ -67,24 +82,81 @@ test:pytest:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == "main"'
 
-# --- build: CPU image (model baked in at build time) ------------------------
+# --- build: CPU image — MR gate (build, NO push) ---
 build:self-speak:
   stage: build
-  image:
-    name: gcr.io/kaniko-project/executor:debug
-    entrypoint: [""]
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
   timeout: 1h
-  before_script:
-    - mkdir -p /kaniko/.docker
-    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_JOB_TOKEN" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
-  script:
-    - >
-      /kaniko/executor
-      --context "$CI_PROJECT_DIR"
-      --dockerfile docker/cpu/Dockerfile
-      --cache=true --cache-repo "$IMAGE/cache"
-      --destination "$IMAGE:$CI_COMMIT_SHORT_SHA"
-      --destination "$IMAGE:latest"
+  before_script: *buildkit-before
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR/docker/cpu"
+      --import-cache "type=registry,ref=${IMAGE}/cache"
+      --export-cache "type=registry,ref=${IMAGE}/cache,mode=max"
+
+# --- publish: CPU image — build + push :sha / :latest (main only) ---
+publish:self-speak:
+  stage: publish
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
+  timeout: 1h
+  before_script: *buildkit-before
+  rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - export TAGS="${IMAGE}:${CI_COMMIT_SHORT_SHA},${IMAGE}:latest"
+    - 'export OUT="type=image,\"name=${TAGS}\",push=true"'
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR/docker/cpu"
+      --import-cache "type=registry,ref=${IMAGE}/cache"
+      --export-cache "type=registry,ref=${IMAGE}/cache,mode=max"
+      --output "$OUT"
+
+# --- build: GPU image (CUDA + torch cu129) — MANUAL MR gate (opt-in, no push) ---
+# Heavy cudnn-DEVEL + torch+cu129 build; manual on MRs so routine MRs don't tie
+# up the shared bigbuild runner for hours, auto on main. allow_failure so a
+# skipped/failed opt-in gate never blocks an MR that didn't need it.
+build:self-speak-gpu:
+  stage: build
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
+  timeout: 3h
+  before_script: *buildkit-before
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+  script:
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR/docker/gpu"
+      --import-cache "type=registry,ref=${IMAGE}/cache-gpu"
+      --export-cache "type=registry,ref=${IMAGE}/cache-gpu,mode=max"
+
+# --- publish: GPU image — build + push :gpu-sha / :gpu-latest (main only) ---
+publish:self-speak-gpu:
+  stage: publish
+  image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
+  timeout: 3h
+  before_script: *buildkit-before
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  script:
+    - export TAGS="${IMAGE}:gpu-${CI_COMMIT_SHORT_SHA},${IMAGE}:gpu-latest"
+    - 'export OUT="type=image,\"name=${TAGS}\",push=true"'
+    - >
+      buildctl-daemonless.sh build
+      --frontend dockerfile.v0
+      --local context="$CI_PROJECT_DIR"
+      --local dockerfile="$CI_PROJECT_DIR/docker/gpu"
+      --import-cache "type=registry,ref=${IMAGE}/cache-gpu"
+      --export-cache "type=registry,ref=${IMAGE}/cache-gpu,mode=max"
+      --output "$OUT"
