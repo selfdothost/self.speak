@@ -267,6 +267,11 @@ class TTSService:
         volume_multiplier: Optional[float] = 1.0,
         normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
         return_timestamps: Optional[bool] = False,
+        engine: str = "kokoro",
+        exaggeration: Optional[float] = None,
+        cfg_weight: Optional[float] = None,
+        audio_prompt_path: Optional[str] = None,
+        references: Optional["list[tuple[str, float]]"] = None,
     ) -> AsyncGenerator[AudioChunk, None]:
         """Generate and stream audio chunks.
 
@@ -278,20 +283,147 @@ class TTSService:
         — is counted for its whole duration. The context manager's ``finally``
         runs when this generator is exhausted OR closed (GeneratorExit), so the
         counter is always decremented, even if the client disconnects mid-stream.
+
+        ``engine`` selects the backend. ``"kokoro"`` (default) is the unchanged
+        in-process Kokoro path. ``"chatterbox"`` proxies to the sibling worker
+        process — and CRITICALLY does so from INSIDE this same ``track_synthesis()``
+        wrapper (INTEGRATION-PLAN-v2.md §1.4 hard dependency): the in-flight
+        counter must reflect Chatterbox work too, or a VRAM release could unload
+        the worker mid-synthesis with no drain protection.
         """
         async with track_synthesis():
-            async for chunk in self._generate_audio_stream_impl(
+            if engine == "chatterbox":
+                async for chunk in self._chatterbox_audio_stream_impl(
+                    text,
+                    writer,
+                    output_format=output_format,
+                    volume_multiplier=volume_multiplier,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                    audio_prompt_path=audio_prompt_path,
+                    references=references,
+                ):
+                    yield chunk
+            elif engine == "kokoro":
+                async for chunk in self._generate_audio_stream_impl(
+                    text,
+                    voice,
+                    writer,
+                    speed=speed,
+                    output_format=output_format,
+                    lang_code=lang_code,
+                    volume_multiplier=volume_multiplier,
+                    normalization_options=normalization_options,
+                    return_timestamps=return_timestamps,
+                ):
+                    yield chunk
+            else:
+                # Engine-mismatch guard: never silently fall through to Kokoro for
+                # an unknown engine (that would mask a routing/config bug).
+                raise ValueError(f"Unsupported TTS engine: {engine!r}")
+
+    async def _chatterbox_audio_stream_impl(
+        self,
+        text: str,
+        writer: StreamingAudioWriter,
+        output_format: Optional[str] = None,
+        volume_multiplier: Optional[float] = 1.0,
+        exaggeration: Optional[float] = None,
+        cfg_weight: Optional[float] = None,
+        audio_prompt_path: Optional[str] = None,
+        references: Optional["list[tuple[str, float]]"] = None,
+    ) -> AsyncGenerator[AudioChunk, None]:
+        """Chatterbox path: one localhost proxy call → one raw waveform → one
+        AudioChunk through the SAME ``StreamingAudioWriter`` the Kokoro path uses.
+
+        The worker returns bare float32 PCM + an ``X-Sample-Rate`` header; all
+        mp3/opus/wav encoding stays here (single-sourced, torch-version-
+        independent — §1.4). With no ``audio_prompt_path`` this is the default
+        voice (``/synth``); with one it is a zero-shot clone in the reference
+        clip's voice (``/clone``) — the Phase-3 clone/preview path. Either way the
+        call is made from inside ``track_synthesis()`` by the caller.
+        """
+        # Imported lazily so the Kokoro-only import graph / VRAM probe path never
+        # drags httpx in at module load.
+        from ..inference import chatterbox_client
+
+        if references and len(references) >= 2:
+            # Multi-clip blend → a NEW interpolated voice (worker /blend).
+            pcm_bytes, sr = await chatterbox_client.blend(
                 text,
-                voice,
+                references,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+            )
+        elif references and len(references) == 1:
+            # A single "blend" reference is just a clone of that clip.
+            pcm_bytes, sr = await chatterbox_client.clone(
+                text,
+                references[0][0],
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+            )
+        elif audio_prompt_path is not None:
+            pcm_bytes, sr = await chatterbox_client.clone(
+                text,
+                audio_prompt_path,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+            )
+        else:
+            pcm_bytes, sr = await chatterbox_client.synth(
+                text, exaggeration=exaggeration, cfg_weight=cfg_weight
+            )
+
+        if sr != writer.sample_rate:
+            # The encoder was built at settings.chatterbox_sample_rate; a mismatch
+            # would pitch-shift the output. Log loudly (Phase 1 does not resample).
+            logger.warning(
+                f"Chatterbox worker sample rate {sr} != writer rate "
+                f"{writer.sample_rate}; audio may be mis-pitched"
+            )
+
+        audio = np.frombuffer(pcm_bytes, dtype=np.float32)
+        if volume_multiplier is not None and volume_multiplier != 1.0:
+            audio = audio * np.float32(volume_multiplier)
+        # np.frombuffer yields a read-only view; downstream normalize/encode want a
+        # writable, owned array.
+        audio = np.array(audio, dtype=np.float32)
+
+        chunk = AudioChunk(audio=audio, word_timestamps=[])
+
+        if output_format:
+            # Encode in TWO calls, exactly like create_speech's non-stream path:
+            # the FIRST (is_last_chunk=False) yields the encoded audio BODY as
+            # .output; the SECOND (empty audio, is_last_chunk=True) yields the
+            # container TRAILER. A single is_last_chunk=True call would return ONLY
+            # the trailer — StreamingAudioWriter truncates its buffer between
+            # writes, so the body would be lost. Yielding both chunks lets the
+            # router's stream concatenator (single_output / dual_output) emit a
+            # complete, valid file for every format (mp3/opus/flac/aac/wav/pcm).
+            body = await AudioService.convert_audio(
+                chunk,
+                output_format,
                 writer,
-                speed=speed,
-                output_format=output_format,
-                lang_code=lang_code,
-                volume_multiplier=volume_multiplier,
-                normalization_options=normalization_options,
-                return_timestamps=return_timestamps,
-            ):
-                yield chunk
+                speed=1.0,
+                chunk_text="",
+                is_last_chunk=False,
+                trim_audio=False,
+                normalizer=AudioNormalizer(),
+            )
+            yield body
+            final = await AudioService.convert_audio(
+                AudioChunk(np.array([], dtype=np.int16)),
+                output_format,
+                writer,
+                is_last_chunk=True,
+            )
+            yield final
+        else:
+            # Raw mode (the generate_audio collector path): yield int16 samples so
+            # AudioChunk.combine (which concatenates as int16) accepts them.
+            chunk.audio = AudioNormalizer().normalize(chunk.audio)
+            yield chunk
 
     async def _generate_audio_stream_impl(
         self,
@@ -451,6 +583,11 @@ class TTSService:
         volume_multiplier: Optional[float] = 1.0,
         normalization_options: Optional[NormalizationOptions] = NormalizationOptions(),
         lang_code: Optional[str] = None,
+        engine: str = "kokoro",
+        exaggeration: Optional[float] = None,
+        cfg_weight: Optional[float] = None,
+        audio_prompt_path: Optional[str] = None,
+        references: Optional["list[tuple[str, float]]"] = None,
     ) -> AudioChunk:
         """Generate complete audio for text using streaming internally."""
         audio_data_chunks = []
@@ -466,6 +603,11 @@ class TTSService:
                 return_timestamps=return_timestamps,
                 lang_code=lang_code,
                 output_format=None,
+                engine=engine,
+                exaggeration=exaggeration,
+                cfg_weight=cfg_weight,
+                audio_prompt_path=audio_prompt_path,
+                references=references,
             ):
                 if len(audio_stream_data.audio) > 0:
                     audio_data_chunks.append(audio_stream_data)

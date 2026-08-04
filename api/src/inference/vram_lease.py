@@ -20,6 +20,7 @@ from typing import AsyncIterator
 
 import torch
 
+from ..core.config import settings
 from ..structures.schemas import VramReleaseResponse
 
 log = logging.getLogger(__name__)
@@ -51,7 +52,14 @@ def _model_resident() -> bool:
 
 
 def probe_vram_state() -> dict:
-    """Compute the tri-state VRAM answer live, on every call (never cached).
+    """The LOCAL (main-process / Kokoro) VRAM leg — sync, live, never cached.
+
+    This is only this process's own CUDA-context accounting. The authoritative
+    wire answer core reads is :func:`probe_vram_state_full`, which aggregates this
+    with the sibling Chatterbox worker's slice when Chatterbox is part of the
+    deployment (Phase 2). This function is kept sync and unchanged so it stays the
+    exact single-engine behaviour on a Kokoro-only deploy and remains the honest
+    fallback when the aggregator's worker leg is dark.
 
     Returns a dict with ``held_vram_bytes``, ``total_capacity_bytes`` (both in
     BYTES), ``gpu_reachable``, ``status``, ``model_resident`` — honouring the
@@ -86,6 +94,10 @@ def probe_vram_state() -> dict:
         return {
             "held_vram_bytes": None,
             "total_capacity_bytes": None,
+            # Card occupancy is UNKNOWN, not zero: we could not read the device
+            # at all. A 0 here would tell core the card is empty (self.ai#74).
+            "device_used_bytes": None,
+            "device_total_bytes": None,
             "gpu_reachable": False,
             "status": "unreachable",
             "model_resident": model_resident,
@@ -96,6 +108,11 @@ def probe_vram_state() -> dict:
         return {
             "held_vram_bytes": 0,
             "total_capacity_bytes": 0,
+            # held 0 is a real, knowable fact (a CPU process holds no VRAM).
+            # Card occupancy is NOT: with no CUDA we cannot see the device, so
+            # this stays null rather than claiming an empty card (self.ai#74).
+            "device_used_bytes": None,
+            "device_total_bytes": None,
             "gpu_reachable": False,
             "status": "no_gpu",
             "model_resident": model_resident,
@@ -103,8 +120,26 @@ def probe_vram_state() -> dict:
 
     # CUDA reports available → attempt the real probe. A throw is case (b).
     try:
-        _free_bytes, total_bytes = torch.cuda.mem_get_info()
-        held_bytes = torch.cuda.memory_allocated()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        # HELD = memory_reserved(), NOT memory_allocated() (self.ai#74 /
+        # self.speak#4). memory_allocated() counts only bytes held by live
+        # tensors; memory_reserved() is what the caching allocator has taken from
+        # the driver and will not return until empty_cache(). Since our own
+        # release path (below) unloads and then calls empty_cache(), reserved is
+        # exactly "what we would give back if asked to release" — the unit
+        # self.ai's broker sums across consumers to decide what is grantable.
+        # Reporting allocated made core believe the card was emptier than it was
+        # (over-grant -> OOM), and made a confirmed release look like it freed
+        # ~0 bytes while genuinely returning gigabytes, because before/after were
+        # measured in a unit blind to what empty_cache() reclaims.
+        held_bytes = torch.cuda.memory_reserved()
+        # DEVICE occupancy is a DIFFERENT quantity: the whole card, every
+        # process, from the same mem_get_info() call we were already making and
+        # discarding half of. Reported separately and NEVER folded into held —
+        # core sums held across consumers, so a whole-card figure in that field
+        # would double-count every sibling. It is how core accounts for CUDA
+        # contexts and non-consumer processes that no consumer can attribute.
+        device_used_bytes = int(total_bytes - free_bytes)
     except Exception as e:
         log.warning(
             "vram-lease: torch.cuda VRAM probe raised (%r); reporting "
@@ -114,6 +149,10 @@ def probe_vram_state() -> dict:
         return {
             "held_vram_bytes": None,
             "total_capacity_bytes": None,
+            # Card occupancy is UNKNOWN, not zero: we could not read the device
+            # at all. A 0 here would tell core the card is empty (self.ai#74).
+            "device_used_bytes": None,
+            "device_total_bytes": None,
             "gpu_reachable": False,
             "status": "unreachable",
             "model_resident": model_resident,
@@ -123,10 +162,84 @@ def probe_vram_state() -> dict:
     return {
         "held_vram_bytes": int(held_bytes),
         "total_capacity_bytes": int(total_bytes),
+        "device_used_bytes": device_used_bytes,
+        "device_total_bytes": int(total_bytes),
         "gpu_reachable": True,
         "status": "ok",
         "model_resident": model_resident,
     }
+
+
+# The established case-(b) unreachable shape (held/total/device all null). Reused
+# verbatim when an EXPECTED Chatterbox worker is unaccountable, because it is the
+# exact contract core already handles as "this consumer is dark, don't count it"
+# — introducing a novel held-null-but-total-known state would risk core's parser
+# under-counting held against a known total (the self.ai#74 over-grant).
+def _unreachable_state(model_resident: bool) -> dict:
+    return {
+        "held_vram_bytes": None,
+        "total_capacity_bytes": None,
+        "device_used_bytes": None,
+        "device_total_bytes": None,
+        "gpu_reachable": False,
+        "status": "unreachable",
+        "model_resident": model_resident,
+    }
+
+
+async def probe_vram_state_full() -> dict:
+    """The AGGREGATED, authoritative wire answer core reads (async).
+
+    Combines the local Kokoro leg (:func:`probe_vram_state`) with the sibling
+    Chatterbox worker's own reserved-VRAM slice into self.speak's single
+    ``held_vram_bytes`` — the whole point of the per-engine-process model's Phase 2
+    (INTEGRATION-PLAN-v2.md §2.4). The two processes own two independent CUDA
+    contexts, so neither ``memory_reserved()`` sees the other; the only correct
+    total is the localhost sum.
+
+    Aggregation is gated on ``settings.chatterbox_enabled``:
+
+    * **disabled** (default; Kokoro-only deploys and the whole pre-deploy window)
+      → return the local leg verbatim. The worker is never queried, so an absent
+      or dark worker can never perturb the already-working single-engine lease.
+    * **enabled but local status != "ok"** → the local leg already dominates:
+      ``no_gpu`` means the whole pod is CPU (the worker holds no VRAM either) and
+      ``unreachable`` is already the null answer. Return it unchanged; querying
+      the worker cannot add signal.
+    * **enabled and local "ok"** → query the worker:
+      - worker reports a real ``held_bytes`` int → held becomes
+        ``local_held + worker_held``; ``model_resident`` ORs in the worker's
+        residency. ``total_capacity_bytes`` / ``device_*`` are whole-card figures
+        from the local ``mem_get_info()`` (which already spans BOTH contexts), so
+        they are left exactly as the local leg reported — never summed again.
+      - worker unreachable, or reports ``held_bytes: null`` (its own probe raised)
+        → **collapse to the case-(b) unreachable shape**. We know Chatterbox is
+        part of this footprint but cannot read its slice; reporting only Kokoro's
+        held would under-report the total and let core over-grant (self.ai#74).
+        Unknown-and-say-so beats a confident under-count.
+    """
+    local = probe_vram_state()
+    if not settings.chatterbox_enabled:
+        return local
+    if local["status"] != "ok":
+        return local
+
+    from . import chatterbox_client
+
+    worker = await chatterbox_client.probe_state()
+    if worker is None or worker.get("held_bytes") is None:
+        # Expected worker, unaccountable slice → dark. Preserve the Kokoro-side
+        # residency signal we do know; hold/capacity go null (never a false 0).
+        return _unreachable_state(bool(local["model_resident"]))
+
+    aggregated = dict(local)
+    aggregated["held_vram_bytes"] = int(local["held_vram_bytes"]) + int(
+        worker["held_bytes"]
+    )
+    aggregated["model_resident"] = bool(local["model_resident"]) or bool(
+        worker.get("resident", False)
+    )
+    return aggregated
 
 
 # ─── T-005: in-flight-synthesis counter + bounded wait-for-drain ─────────
@@ -227,8 +340,35 @@ def _unload_backend() -> None:
         )
 
 
+async def _release_chatterbox_worker(
+    target_bytes: int, timeout_seconds: float, force: bool = False
+) -> None:
+    """Best-effort: ask the sibling Chatterbox worker to unload + empty_cache
+    toward ``target_bytes`` (INTEGRATION-PLAN-v2.md §1.4). Swallows every failure
+    — a down/absent/CPU-only worker (or one with no httpx path) must never fail the
+    Kokoro release. Phase-1 scope: this drives the worker's own free; the
+    cross-process held/freed AGGREGATION and the async tri-state probe are Phase 2.
+    """
+    try:
+        from . import chatterbox_client
+
+        result = await chatterbox_client.release(target_bytes, timeout_seconds, force)
+        if result is not None:
+            log.info(
+                "vram-lease: chatterbox worker release -> %s (freed=%s bytes)",
+                result.get("status"),
+                result.get("freed_bytes"),
+            )
+    except Exception as e:
+        log.warning(
+            "vram-lease: chatterbox worker release raised (%r); continuing to "
+            "live-verify the Kokoro-side delta",
+            e,
+        )
+
+
 async def handle_vram_release(
-    target_bytes: int, timeout_seconds: float
+    target_bytes: int, timeout_seconds: float, force: bool = False
 ) -> VramReleaseResponse:
     """Answer a release-request: single-flight, drain-wait, live-verified.
 
@@ -244,11 +384,19 @@ async def handle_vram_release(
     4. **Drain-wait (AC2/AC6):** wait — bounded by ``timeout_seconds`` — for
        in-flight synthesis to drain. Idle → returns immediately. Still
        generating at the deadline → ``partial``/0 with NO unload (never yank the
-       model from under an active request).
-    5. **Free:** unload the Kokoro backend (only if resident).
+       model from under an active request). **SKIPPED entirely when ``force``.**
+    5. **Free:** unload the Kokoro backend (only if resident) + cascade to the
+       Chatterbox worker (forwarding ``force``).
     6. **Verify live (AC3/AC5):** re-probe held; ``freed = max(0, before -
        after)`` measured from the live delta, never inferred. ``released`` iff
        ``freed >= target_bytes`` else a truthful ``partial``.
+
+    ``force`` (the admin 'Unload All Models' e-stop, "stop now short of pulling
+    the plug"): skip the step-4 drain-wait and unload immediately even if a
+    synthesis is mid-flight (that request gets a truncated/cut stream — acceptable
+    for an e-stop), and forward force to the Chatterbox worker so it does the same.
+    Default False keeps the routine, polite, priority-driven broker path exactly
+    as it was.
     """
     global _release_in_flight
 
@@ -257,7 +405,9 @@ async def handle_vram_release(
         return VramReleaseResponse(status="busy", freed_bytes=0)
     _release_in_flight = True
     try:
-        state = probe_vram_state()
+        # Aggregated baseline: includes the Chatterbox worker's held slice when
+        # enabled, so ``freed`` below reflects a worker-side free too (Phase 2).
+        state = await probe_vram_state_full()
         status = state["status"]
 
         # 2. AC8: CPU / no-CUDA → honest zero-freed no-op (target-of-nothing met).
@@ -273,17 +423,30 @@ async def handle_vram_release(
         if before is None:
             return VramReleaseResponse(status="partial", freed_bytes=0)
 
-        # 4. AC2/AC6: drain in-flight synthesis, bounded by the timeout.
-        drained = await wait_for_drain(timeout_seconds)
-        if not drained:
-            # Still generating at the deadline — never unload out from under it.
-            return VramReleaseResponse(status="partial", freed_bytes=0)
+        # 4. AC2/AC6: drain in-flight synthesis, bounded by the timeout — UNLESS
+        # this is a force e-stop, which unloads now regardless of in-flight work.
+        if not force:
+            drained = await wait_for_drain(timeout_seconds)
+            if not drained:
+                # Still generating at the deadline — never yank a cooperative
+                # release out from under it. (A force e-stop skips this entirely.)
+                return VramReleaseResponse(status="partial", freed_bytes=0)
 
         # 5. Free (only if a model is actually resident).
         _unload_backend()
+        # Also ask the sibling Chatterbox worker to release — only when it is part
+        # of this deployment's footprint. Without this a release would free only
+        # Kokoro and leave the worker's (far larger) VRAM resident forever. Best-
+        # effort and swallowed: a down/absent worker must not fail the Kokoro
+        # release. Phase 2: because the baseline and re-verify below both go
+        # through probe_vram_state_full() (which sums the worker's held slice), a
+        # worker-side free IS now reflected in freed_bytes — the delta spans both
+        # CUDA contexts, not just the main process's.
+        if settings.chatterbox_enabled:
+            await _release_chatterbox_worker(target_bytes, timeout_seconds, force)
 
-        # 6. AC3/AC5: verify live via a fresh probe.
-        after_state = probe_vram_state()
+        # 6. AC3/AC5: verify live via a fresh aggregated probe.
+        after_state = await probe_vram_state_full()
         after = after_state["held_vram_bytes"]
         if after is None:
             # Probe went unreachable across the free — can't confirm a delta.

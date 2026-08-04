@@ -17,7 +17,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..core.auth import SCOPE_SYSTEM_READ, SCOPE_SYSTEM_WRITE, require_scope
-from ..inference.vram_lease import handle_vram_release, probe_vram_state
+from ..inference.vram_lease import handle_vram_release, probe_vram_state_full
 from ..structures.schemas import (
     VramReleaseRequest,
     VramReleaseResponse,
@@ -35,8 +35,9 @@ async def vram_state(
     """Report currently-held VRAM and total addressable capacity, in bytes
     (cavekit-vram-lease-client R1 — T-007).
 
-    Computes the figures live on every call via ``probe_vram_state()`` (never
-    cached — R1-AC2) and marshals the tri-state result straight through into
+    Computes the figures live on every call via ``probe_vram_state_full()`` (the
+    aggregated Kokoro + Chatterbox-worker probe; never cached — R1-AC2) and
+    marshals the tri-state result straight through into
     ``VramStateResponse``. **Always returns HTTP 200** (R1-AC3): when the GPU is
     unreachable (case b) or absent (case c) the null/zero figures plus the
     ``status`` / ``gpu_reachable`` fields carry the signal — an HTTP error would
@@ -45,10 +46,11 @@ async def vram_state(
     never a 500 that would mask the state.
     """
     try:
-        probe = probe_vram_state()
+        probe = await probe_vram_state_full()
     except Exception as e:
-        # A probe should never raise (its CUDA calls are already guarded), but if
-        # it somehow does, still answer 200 with a truthful unreachable body —
+        # A probe should never raise (its CUDA calls are already guarded, and the
+        # worker leg swallows its own errors), but if it somehow does, still answer
+        # 200 with a truthful unreachable body —
         # null figures, never a false 0, never a 5xx (R1-AC3/AC5).
         log.warning(
             "vram-lease: probe_vram_state raised unexpectedly (%r); returning "
@@ -58,6 +60,9 @@ async def vram_state(
         probe = {
             "held_vram_bytes": None,
             "total_capacity_bytes": None,
+            # Unknown, not empty — see VramStateResponse (self.ai#74).
+            "device_used_bytes": None,
+            "device_total_bytes": None,
             "gpu_reachable": False,
             "status": "unreachable",
             "model_resident": False,
@@ -81,7 +86,7 @@ async def vram_release(
     unambiguous signal core's transport reads as "not now", rather than a
     misleading 200-with-zero.
     """
-    result = await handle_vram_release(req.target_bytes, req.timeout_seconds)
+    result = await handle_vram_release(req.target_bytes, req.timeout_seconds, req.force)
     if result.status == "busy":
         raise HTTPException(
             status_code=409,

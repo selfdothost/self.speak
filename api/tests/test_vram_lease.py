@@ -51,20 +51,27 @@ class TestProbeVramState:
         """(a) GPU reachable & probed → real ints, status='ok' (R1-AC4)."""
         with patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
              patch.object(vram_lease.torch.cuda, "mem_get_info", return_value=(2 * _GB, 24 * _GB)), \
-             patch.object(vram_lease.torch.cuda, "memory_allocated", return_value=5 * _GB):
+             patch.object(vram_lease.torch.cuda, "memory_reserved", return_value=5 * _GB):
             state = probe_vram_state()
         assert state["status"] == "ok"
         assert state["gpu_reachable"] is True
         assert isinstance(state["held_vram_bytes"], int)
         assert isinstance(state["total_capacity_bytes"], int)
+        # HELD is memory_reserved() — what empty_cache() would give back — not
+        # memory_allocated() (self.ai#74 / self.speak#4).
         assert state["held_vram_bytes"] == 5 * _GB
         assert state["total_capacity_bytes"] == 24 * _GB
+        # Card occupancy is a SEPARATE quantity: total - free = 24 - 2 = 22 GiB,
+        # deliberately NOT equal to this consumer's 5 GiB held. Core must never
+        # sum the two.
+        assert state["device_used_bytes"] == 22 * _GB
+        assert state["device_total_bytes"] == 24 * _GB
 
     def test_case_a_idle_held_is_near_zero_int_not_null(self):
         """(a) idle → held is a real (near-zero) int, NOT null (R1-AC4)."""
         with patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
              patch.object(vram_lease.torch.cuda, "mem_get_info", return_value=(24 * _GB, 24 * _GB)), \
-             patch.object(vram_lease.torch.cuda, "memory_allocated", return_value=0):
+             patch.object(vram_lease.torch.cuda, "memory_reserved", return_value=0):
             state = probe_vram_state()
         assert state["status"] == "ok"
         assert state["held_vram_bytes"] == 0
@@ -75,7 +82,7 @@ class TestProbeVramState:
         (R1-AC4/AC5). The try/except is load-bearing — a throw must not crash."""
         with patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
              patch.object(vram_lease.torch.cuda, "mem_get_info", side_effect=RuntimeError("CUDA init failed")), \
-             patch.object(vram_lease.torch.cuda, "memory_allocated", return_value=0):
+             patch.object(vram_lease.torch.cuda, "memory_reserved", return_value=0):
             state = probe_vram_state()
         assert state["status"] == "unreachable"
         assert state["gpu_reachable"] is False
@@ -83,6 +90,9 @@ class TestProbeVramState:
         assert state["total_capacity_bytes"] is None
         # The false-zero R1-AC5 explicitly bans.
         assert state["held_vram_bytes"] != 0
+        # Card occupancy is UNKNOWN here, not empty — same ban applies.
+        assert state["device_used_bytes"] is None
+        assert state["device_total_bytes"] is None
 
     def test_case_c_no_cuda_returns_integer_zero(self):
         """(c) no CUDA → integer 0, status='no_gpu' (R1-AC4). Runs UNMOCKED and
@@ -93,6 +103,10 @@ class TestProbeVramState:
         assert state["gpu_reachable"] is False
         assert state["held_vram_bytes"] == 0
         assert state["total_capacity_bytes"] == 0
+        # held 0 is knowable (a CPU process holds no VRAM); card occupancy is
+        # not — with no CUDA we cannot see the device at all (self.ai#74).
+        assert state["device_used_bytes"] is None
+        assert state["device_total_bytes"] is None
 
     def test_case_c_unmocked_cpu_is_no_gpu(self):
         """Live CI gate: on CPU torch the unmocked probe is case (c)."""
@@ -109,7 +123,7 @@ class TestProbeVramState:
         never a cached figure."""
         with patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
              patch.object(vram_lease.torch.cuda, "mem_get_info", return_value=(0, 24 * _GB)), \
-             patch.object(vram_lease.torch.cuda, "memory_allocated", side_effect=[3 * _GB, 7 * _GB]):
+             patch.object(vram_lease.torch.cuda, "memory_reserved", side_effect=[3 * _GB, 7 * _GB]):
             first = probe_vram_state()
             second = probe_vram_state()
         assert first["held_vram_bytes"] == 3 * _GB
@@ -345,8 +359,8 @@ def _write_hdr():
 class TestVramStateEndpoint:
     def test_case_a_returns_200_with_byte_fields(self, client):
         """R1-AC1/AC3: system:read ticket → 200 with int byte figures."""
-        with patch("api.src.routers.system.probe_vram_state",
-                   return_value=_state("ok", 5 * _GB)):
+        with patch("api.src.routers.system.probe_vram_state_full",
+                   AsyncMock(return_value=_state("ok", 5 * _GB))):
             resp = client.get("/api/system/vram-state", headers=_read_hdr())
         assert resp.status_code == 200
         body = resp.json()
@@ -356,8 +370,8 @@ class TestVramStateEndpoint:
 
     def test_case_b_returns_200_null_not_5xx(self, client):
         """R1-AC3/AC4/AC5: unreachable → 200 with null held, never a 5xx, never 0."""
-        with patch("api.src.routers.system.probe_vram_state",
-                   return_value=_state("unreachable", None)):
+        with patch("api.src.routers.system.probe_vram_state_full",
+                   AsyncMock(return_value=_state("unreachable", None))):
             resp = client.get("/api/system/vram-state", headers=_read_hdr())
         assert resp.status_code == 200
         body = resp.json()
@@ -366,8 +380,8 @@ class TestVramStateEndpoint:
 
     def test_case_c_returns_200_integer_zero(self, client):
         """R1-AC4: no-CUDA → 200 with integer-0 held and status no_gpu."""
-        with patch("api.src.routers.system.probe_vram_state",
-                   return_value=_state("no_gpu", 0)):
+        with patch("api.src.routers.system.probe_vram_state_full",
+                   AsyncMock(return_value=_state("no_gpu", 0))):
             resp = client.get("/api/system/vram-state", headers=_read_hdr())
         assert resp.status_code == 200
         body = resp.json()
@@ -376,8 +390,8 @@ class TestVramStateEndpoint:
 
     def test_probe_exception_still_200_unreachable(self, client):
         """R1-AC3: even an unexpected probe raise → 200 unreachable, not 500."""
-        with patch("api.src.routers.system.probe_vram_state",
-                   side_effect=RuntimeError("unexpected")):
+        with patch("api.src.routers.system.probe_vram_state_full",
+                   AsyncMock(side_effect=RuntimeError("unexpected"))):
             resp = client.get("/api/system/vram-state", headers=_read_hdr())
         assert resp.status_code == 200
         assert resp.json()["status"] == "unreachable"

@@ -81,6 +81,40 @@ def get_model_name(model: str) -> str:
     return base_name + ".pth"
 
 
+def get_engine(model: str) -> str:
+    """Resolve the serving engine from the request ``model`` field.
+
+    Wires the previously-dead ``request.model`` to an engine dispatch key via
+    ``openai_mappings.json``'s ``engines`` map (INTEGRATION-PLAN-v2.md §5). Unknown
+    or unmapped models default to ``"kokoro"`` — the historical single-engine
+    behaviour — so existing tts-1/kokoro callers are unaffected.
+    """
+    return _openai_mappings.get("engines", {}).get(model, "kokoro")
+
+
+def engine_sample_rate(engine: str) -> int:
+    """Sample rate the output encoder is built at, per engine. Kokoro is 24 kHz;
+    Chatterbox uses ``settings.chatterbox_sample_rate`` (the worker reports the
+    real rate per request and the service logs any mismatch)."""
+    if engine == "chatterbox":
+        return settings.chatterbox_sample_rate
+    return 24000
+
+
+async def resolve_voice_for_engine(
+    voice_input: Union[str, List[str]], tts_service: TTSService, engine: str
+) -> str:
+    """Kokoro validates the voice against its catalog; Chatterbox (Phase 1) serves
+    the default voice and does not use the Kokoro catalog, so the raw voice is
+    passed through unvalidated (INTEGRATION-PLAN-v2.md §5 "Chatterbox voice
+    fallback in process_and_validate_voices")."""
+    if engine == "kokoro":
+        return await process_and_validate_voices(voice_input, tts_service)
+    if isinstance(voice_input, list):
+        return voice_input[0] if voice_input else ""
+    return voice_input
+
+
 async def process_and_validate_voices(
     voice_input: Union[str, List[str]], tts_service: TTSService
 ) -> str:
@@ -140,7 +174,8 @@ async def stream_audio_chunks(
     writer: StreamingAudioWriter,
 ) -> AsyncGenerator[AudioChunk, None]:
     """Stream audio chunks as they're generated with client disconnect handling"""
-    voice_name = await process_and_validate_voices(request.voice, tts_service)
+    engine = get_engine(request.model)
+    voice_name = await resolve_voice_for_engine(request.voice, tts_service, engine)
     unique_properties = {"return_timestamps": False}
     if hasattr(request, "return_timestamps"):
         unique_properties["return_timestamps"] = request.return_timestamps
@@ -156,6 +191,9 @@ async def stream_audio_chunks(
             volume_multiplier=request.volume_multiplier,
             normalization_options=request.normalization_options,
             return_timestamps=unique_properties["return_timestamps"],
+            engine=engine,
+            exaggeration=getattr(request, "exaggeration", None),
+            cfg_weight=getattr(request, "cfg_weight", None),
         ):
             # Check if client is still connected
             is_disconnected = client_request.is_disconnected
@@ -194,7 +232,13 @@ async def create_speech(
     try:
         # model_name = get_model_name(request.model)
         tts_service = await get_tts_service()
-        voice_name = await process_and_validate_voices(request.voice, tts_service)
+        # Resolve the serving engine from request.model, then resolve the voice
+        # under that engine (Kokoro validates against its catalog; Chatterbox
+        # serves the default voice in Phase 1).
+        engine = get_engine(request.model)
+        voice_name = await resolve_voice_for_engine(
+            request.voice, tts_service, engine
+        )
 
         # Set content type based on format
         content_type = {
@@ -206,7 +250,9 @@ async def create_speech(
             "pcm": "audio/pcm",
         }.get(request.response_format, f"audio/{request.response_format}")
 
-        writer = StreamingAudioWriter(request.response_format, sample_rate=24000)
+        writer = StreamingAudioWriter(
+            request.response_format, sample_rate=engine_sample_rate(engine)
+        )
 
         # Check if streaming is requested (default for OpenAI client)
         if request.stream:
@@ -306,6 +352,9 @@ async def create_speech(
                 volume_multiplier=request.volume_multiplier,
                 normalization_options=request.normalization_options,
                 lang_code=request.lang_code,
+                engine=engine,
+                exaggeration=getattr(request, "exaggeration", None),
+                cfg_weight=getattr(request, "cfg_weight", None),
             )
 
             audio_data = await AudioService.convert_audio(

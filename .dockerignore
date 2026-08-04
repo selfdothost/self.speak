@@ -34,6 +34,7 @@ tests/
 *.md
 *.txt
 !requirements.txt
+!requirements-chatterbox.txt
 
 # Docker
 Dockerfile*

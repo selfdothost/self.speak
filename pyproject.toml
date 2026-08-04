@@ -8,6 +8,11 @@ dependencies = [
     # Core dependencies
     "fastapi==0.115.6",
     "uvicorn==0.34.0",
+    # Required by FastAPI to parse multipart/form-data — the Chatterbox clone/
+    # preview routes (routers/control.py) take the reference clip as an upload.
+    # Without it FastAPI raises at route registration, so ANY import of `app`
+    # (incl. the whole test suite) fails collection, not just the clone routes.
+    "python-multipart==0.0.20",
     "click>=8.0.0",
     "pydantic==2.10.4",
     "pydantic-settings==2.7.0",
@@ -28,6 +33,11 @@ dependencies = [
     "aiofiles==23.2.1",
     "tqdm==4.67.1",
     "requests==2.32.3",
+    # Async client for the main process -> Chatterbox worker localhost proxy
+    # (api/src/inference/chatterbox_client.py, INTEGRATION-PLAN-v2.md §1.4).
+    # Promoted from the test-only extra: `uv sync --extra gpu` (the runtime venv)
+    # does NOT install the test extra, so the client needs httpx as a main dep.
+    "httpx==0.26.0",
     "munch==4.0.0",
     "tiktoken==0.8.0",
     "loguru==0.7.3",
@@ -57,7 +67,8 @@ rocm = [
 test = [
     "pytest==8.3.5",
     "pytest-cov==6.0.0",
-    "httpx==0.26.0",
+    # httpx moved to the main [project] dependencies (runtime needs it for the
+    # Chatterbox worker proxy); kept resolvable here transitively.
     "pytest-asyncio==0.25.3",
     "tomli>=2.0.1",
     "jinja2>=3.1.6",

@@ -41,3 +41,19 @@ The original Apache-2.0 license text is preserved verbatim in
 LICENSE.kokoro-fastapi-apache. Kokoro-FastAPI's own upstream distribution
 included no NOTICE file of its own to propagate; this file is self.speak's
 own attribution notice per Apache-2.0 section 4(d).
+
+--------------------------------------------------------------------------------
+Chatterbox TTS (Resemble AI) — MIT
+--------------------------------------------------------------------------------
+
+self.speak's second (voice-cloning) engine is Resemble AI's Chatterbox
+(https://github.com/resemble-ai/chatterbox), used UNMODIFIED as a pip dependency
+(`chatterbox-tts`) installed into an isolated second venv (/app/.venv-chatterbox),
+plus the `ResembleAI/chatterbox` model weights pulled at runtime from the Hugging
+Face Hub. Both the `chatterbox-tts` package and the Chatterbox model weights are
+licensed MIT by Resemble AI. Like the Kokoro dependencies above, Chatterbox is an
+unmodified third-party component used as-is; only self.speak's own worker/adapter
+code (api/src/chatterbox_worker/) is original and licensed GPLv3 with the rest of
+this repo. MIT is one-way compatible with GPLv3, so the combined work is GPLv3
+while Chatterbox's MIT terms are honored for the unmodified upstream component.
+self.speak is not affiliated with, endorsed by, or connected to Resemble AI.

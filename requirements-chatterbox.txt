@@ -1,0 +1,36 @@
+# Chatterbox WORKER venv (/app/.venv-chatterbox) — torch 2.6.0, ISOLATED from the
+# main app's torch 2.8.0+cu129 venv. See docker/gpu/Dockerfile (dual-venv build)
+# and INTEGRATION-PLAN-v2.md §3. Deliberately kept OUT of pyproject.toml's
+# [tool.uv] conflicts solve so it never contaminates the main (Kokoro) resolve.
+#
+# chatterbox-tts pins torch==2.6.0 / torchaudio==2.6.0 transitively (for
+# python<3.14); the cu124 wheels below give those CUDA builds. The host driver
+# (12.9, via the nvidia runtime) is newer and forward-compatible, and the
+# container-wide `rm -rf /usr/local/cuda/compat` + LD_LIBRARY_PATH host-libcuda-
+# first fix covers BOTH venvs' torch. There is NO Turbo/Nano model selector —
+# ChatterboxTTS.from_pretrained() downloads the single published model.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+chatterbox-tts==0.1.7
+resemble-perth==1.0.1
+
+# The worker's HTTP surface (chatterbox_worker/main.py) imports fastapi/uvicorn/
+# pydantic DIRECTLY. Today these arrive only transitively via chatterbox-tts ->
+# gradio 6.8.0. Declare them explicitly so the worker never depends on that
+# incidental closure: if a future chatterbox-tts drops or loosens gradio, the
+# worker still gets its web stack instead of respawn-looping on a ModuleNotFound
+# import while Kokoro keeps serving (the failure is silent -- surfaces only as a
+# 503 on model=chatterbox). Floors match gradio 6.8.0's own constraints.
+fastapi>=0.115.2
+uvicorn>=0.14.0
+pydantic>=2,<3
+
+# chatterbox-tts -> perth (resemble-perth) does `from pkg_resources import
+# resource_filename` in perth/perth_net/__init__.py. pkg_resources ships with
+# setuptools, but (a) uv venvs don't install setuptools by default and (b)
+# setuptools>=81 REMOVED pkg_resources entirely. Without it, perth swallows the
+# ImportError and sets PerthImplicitWatermarker=None, so ChatterboxTTS.__init__
+# dies with `'NoneType' object is not callable` at model load — every synth/clone
+# 500s. Pin <81 so pkg_resources is present. (Diagnosed live on the first deploy,
+# gpu-4e2b4314: load reached the watermarker line, then TypeError.)
+setuptools<81

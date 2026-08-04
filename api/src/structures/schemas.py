@@ -121,6 +121,18 @@ class OpenAISpeechRequest(BaseModel):
         default=NormalizationOptions(),
         description="Options for the normalization system",
     )
+    # ── Chatterbox-only controls (ignored by the Kokoro engine) ─────────────
+    # Optional knobs forwarded verbatim to the Chatterbox worker when
+    # model=chatterbox resolves to that engine (INTEGRATION-PLAN-v2.md §1.4 /
+    # §5). Left None for Kokoro requests, which never see them.
+    exaggeration: Optional[float] = Field(
+        default=None,
+        description="Chatterbox only: emotion/intensity exaggeration knob. Ignored by Kokoro.",
+    )
+    cfg_weight: Optional[float] = Field(
+        default=None,
+        description="Chatterbox only: classifier-free-guidance weight / pacing knob. Ignored by Kokoro.",
+    )
 
 
 class VramStateResponse(BaseModel):
@@ -146,6 +158,14 @@ class VramStateResponse(BaseModel):
 
     ``Optional[int]`` (not ``int``) is deliberate: a plain ``int`` field would
     forbid the case-(b) null and force the very false-zero R1-AC5 bans.
+
+    ``held_vram_bytes`` means: **the VRAM this process would give back if asked
+    to fully release** — ``torch.cuda.memory_reserved()``, which is precisely
+    what our own release path's ``empty_cache()`` returns to the driver. It is
+    NOT ``memory_allocated()`` (live-tensor bytes only, blind to the reserved
+    pool and so an under-report core would over-grant against, self.ai#74), and
+    it is NOT the whole card — that is ``device_used_bytes``, reported
+    separately below because core SUMS held across consumers.
     """
 
     held_vram_bytes: Optional[int] = Field(
@@ -186,6 +206,27 @@ class VramStateResponse(BaseModel):
             "(observability; not part of the byte accounting)."
         ),
     )
+    device_used_bytes: Optional[int] = Field(
+        default=None,
+        description=(
+            "WHOLE-CARD VRAM in use in BYTES, every process included — a "
+            "DIFFERENT quantity from held_vram_bytes and never to be summed "
+            "with it (self.ai#74). Core sums held_vram_bytes across consumers, "
+            "so a whole-card figure in that field would double-count every "
+            "sibling; this one lets core account for CUDA contexts and "
+            "processes that are not lease consumers at all. null whenever the "
+            "device could not be read (cases b AND c) — with no CUDA we cannot "
+            "see the card, and 0 would falsely assert an empty one."
+        ),
+    )
+    device_total_bytes: Optional[int] = Field(
+        default=None,
+        description=(
+            "Total card size in BYTES accompanying device_used_bytes. Equal to "
+            "total_capacity_bytes in case (a); null whenever the device could "
+            "not be read."
+        ),
+    )
 
 
 class VramReleaseRequest(BaseModel):
@@ -207,6 +248,19 @@ class VramReleaseRequest(BaseModel):
         description=(
             "Wall-clock budget: the handler drains in-flight synthesis bounded "
             "by this and NEVER blocks past it."
+        ),
+    )
+    force: bool = Field(
+        default=False,
+        description=(
+            "E-STOP semantics. Default False = the cooperative lease release "
+            "(drain in-flight synthesis first, bounded by timeout_seconds). True "
+            "= unload NOW regardless of in-flight work: skip the drain-wait and "
+            "force-unload EVERY engine (Kokoro + the Chatterbox worker) "
+            "immediately. Set only by the admin 'Unload All Models' e-stop — "
+            "'stop now, short of pulling the plug' — never by the routine "
+            "priority-based broker path. Not a mechanism field: self.speak still "
+            "decides HOW to free; force only decides whether to wait."
         ),
     )
 
@@ -289,4 +343,39 @@ class CaptionedSpeechRequest(BaseModel):
     normalization_options: Optional[NormalizationOptions] = Field(
         default=NormalizationOptions(),
         description="Options for the normalization system",
+    )
+
+
+class CloneSpeechRequest(BaseModel):
+    """Field contract for the Chatterbox clone/preview control routes
+    (``POST /api/voices/clone`` and ``/api/voices/preview``, INTEGRATION-PLAN-v2.md
+    Phase 3). The reference audio itself rides the request as a multipart file, so
+    these routes bind the non-file fields via ``Form(...)`` and validate them
+    through this model — one source of truth for the accepted params.
+
+    self.speak's clone surface is deliberately STATELESS: it takes reference bytes
+    + text and returns audio. Persistent reference-clip storage and the voice asset
+    live in self.ai (the Phase-4 connector + Garage), never on this backend.
+    """
+
+    text: str = Field(
+        ...,
+        min_length=1,
+        description="Text to synthesise in the reference clip's voice.",
+    )
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = Field(
+        default="wav",
+        description="Audio output format (same set as /v1/audio/speech).",
+    )
+    exaggeration: Optional[float] = Field(
+        default=None,
+        description="Chatterbox emotion-exaggeration control (engine default when null).",
+    )
+    cfg_weight: Optional[float] = Field(
+        default=None,
+        description="Chatterbox classifier-free-guidance weight (engine default when null).",
+    )
+    volume_multiplier: Optional[float] = Field(
+        default=1.0,
+        description="A volume multiplier to multiply the output audio by.",
     )

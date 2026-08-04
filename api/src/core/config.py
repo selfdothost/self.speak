@@ -29,6 +29,42 @@ class Settings(BaseSettings):
     model_dir: str = "/app/api/src/models"  # Absolute path in container
     voices_dir: str = "/app/api/src/voices/v1_0"  # Absolute path in container
 
+    # ── Chatterbox WORKER (second engine, sibling process) ──────────────────
+    # The main process proxies Chatterbox synthesis to a sibling worker over
+    # localhost (INTEGRATION-PLAN-v2.md §1.4). These are all INTERNAL to the
+    # container — core never talks to the worker; it only ever talks to main.
+    #
+    # NOTE: there is deliberately NO CHATTERBOX_MODEL selector — there is no
+    # Turbo/Nano API; ChatterboxTTS.from_pretrained() downloads the one model.
+    #
+    # Whether Chatterbox is part of THIS deployment's VRAM footprint (env:
+    # CHATTERBOX_ENABLED). This is the gate for the Phase-2 cross-process VRAM
+    # aggregation, NOT for whether the worker process launches (the entrypoint
+    # starts the worker whenever its venv exists). It answers one question for the
+    # VRAM lease: "should self.speak's held_vram_bytes include a Chatterbox
+    # worker's slice?" Default False so a Kokoro-only deploy — and the whole
+    # pre-Phase-1-deploy window — behaves EXACTLY as the single-engine lease did:
+    # the aggregator never touches the worker, and an absent/dark worker can never
+    # collapse the working Kokoro lease to "unreachable". Set True on the GPU
+    # sibling (speak-gpu.yaml) once the worker is deployed and measured. When True,
+    # an EXPECTED-but-unaccountable worker collapses held to null/unreachable
+    # rather than under-reporting it (the self.ai#74 over-grant).
+    chatterbox_enabled: bool = False
+    chatterbox_control_url: str = (
+        "http://127.0.0.1:8881"  # worker's localhost control API (env: CHATTERBOX_CONTROL_URL)
+    )
+    chatterbox_voices_dir: str = (
+        "/app/api/src/chatterbox_voices"  # reference-clip staging (clone route, Phase 3)
+    )
+    # Chatterbox's native output sample rate. The worker reports the real rate per
+    # request via X-Sample-Rate; this is the rate the main process builds its
+    # encoder at, and a mismatch is logged (chatterbox-tts==0.1.7 is 24 kHz).
+    chatterbox_sample_rate: int = 24000
+    # HF Hub cache home for the worker's runtime weight pull (~2 GB, NOT baked).
+    # A self.speak model-cache PVC subPath at deploy (self.transcribe's pattern).
+    # Exported into the container env so huggingface_hub in the worker honours it.
+    hf_home: str = "/app/.cache/huggingface"  # env: HF_HOME
+
     # Audio Settings
     sample_rate: int = 24000
     default_volume_multiplier: float = 1.0

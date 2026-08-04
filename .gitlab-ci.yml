@@ -24,6 +24,15 @@ default:
 variables:
   IMAGE: $CI_REGISTRY_IMAGE
   BUILDKIT_IMAGE: "moby/buildkit:v0.31.2-rootless"   # pinned, not master
+  # Force a FRESH clone every build. The bigbuild runner keeps a persistent
+  # checkout on its scratch PVC; on 2026-07-31 that checkout went STALE (stuck at
+  # the pre-setuptools-fix commit, likely a silently-failed fetch during the
+  # registry/DNS flakiness), so buildkit's --local context fed OLD source and every
+  # GPU image shipped a pre-fix requirements-chatterbox.txt + a worker venv missing
+  # setuptools -> every Chatterbox synth 500'd. GIT_STRATEGY=clone + a clean wipe
+  # make a stale checkout impossible.
+  GIT_STRATEGY: clone
+  GIT_CLEAN_FLAGS: "-ffdx"
   # Bursty CI jobs: SMALL requests so a job schedules even on a busy node, HIGH
   # limits so it can burst when it actually runs. These jobs sit idle until
   # triggered, need real CPU/RAM only briefly, and don't all run at once — so
@@ -123,6 +132,15 @@ publish:self-speak:
 # Heavy cudnn-DEVEL + torch+cu129 build; manual on MRs so routine MRs don't tie
 # up the shared bigbuild runner for hours, auto on main. allow_failure so a
 # skipped/failed opt-in gate never blocks an MR that didn't need it.
+#
+# NOTE (2026-07-30): the GPU cache ref is `cache-gpu2`, not `cache-gpu`. The
+# original cache-gpu got POISONED — after requirements-chatterbox.txt changed
+# (adding setuptools<81) AND the Dockerfile got a cache-bust ARG, buildkit still
+# reported every layer CACHED and republished a byte-identical image (gpu-4e2b4314
+# == gpu-24f651ee == gpu-0583c6f0, same sha256:d9bdba30), so the setuptools fix
+# never reached the image. Rotating to a fresh cache key forces one clean rebuild
+# and leaves normal caching intact going forward. If this recurs, rotate again
+# (cache-gpu3) or add --no-cache to a one-off build.
 build:self-speak-gpu:
   stage: build
   image: { name: "$BUILDKIT_IMAGE", entrypoint: [""] }
@@ -138,8 +156,8 @@ build:self-speak-gpu:
       --frontend dockerfile.v0
       --local context="$CI_PROJECT_DIR"
       --local dockerfile="$CI_PROJECT_DIR/docker/gpu"
-      --import-cache "type=registry,ref=${IMAGE}/cache-gpu"
-      --export-cache "type=registry,ref=${IMAGE}/cache-gpu,mode=max"
+      --import-cache "type=registry,ref=${IMAGE}/cache-gpu2"
+      --export-cache "type=registry,ref=${IMAGE}/cache-gpu2,mode=max"
 
 # --- publish: GPU image — build + push :gpu-sha / :gpu-latest (main only) ---
 publish:self-speak-gpu:
@@ -157,6 +175,6 @@ publish:self-speak-gpu:
       --frontend dockerfile.v0
       --local context="$CI_PROJECT_DIR"
       --local dockerfile="$CI_PROJECT_DIR/docker/gpu"
-      --import-cache "type=registry,ref=${IMAGE}/cache-gpu"
-      --export-cache "type=registry,ref=${IMAGE}/cache-gpu,mode=max"
+      --import-cache "type=registry,ref=${IMAGE}/cache-gpu2"
+      --export-cache "type=registry,ref=${IMAGE}/cache-gpu2,mode=max"
       --output "$OUT"
