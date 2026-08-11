@@ -60,8 +60,8 @@ class TestProbeAggregation:
         assert state["held_vram_bytes"] == 8 * _GB
         assert state["status"] == "ok"
         assert state["gpu_reachable"] is True
-        # Whole-card figures come from the local mem_get_info() (spans BOTH
-        # contexts already) and must NOT be summed again.
+        # Whole-card figures come from the local NVML read (which sees BOTH
+        # contexts already, being a card-wide figure) and must NOT be summed.
         assert state["total_capacity_bytes"] == 24 * _GB
         assert state["device_total_bytes"] == 24 * _GB
 

@@ -1,5 +1,7 @@
 """Clean Kokoro implementation with controlled resource management."""
 
+import asyncio
+import gc
 import os
 from typing import AsyncGenerator, Dict, Optional, Tuple, Union
 
@@ -17,6 +19,12 @@ from .base import AudioChunk, BaseModelBackend
 
 class KokoroV1(BaseModelBackend):
     """Kokoro backend with controlled resource management."""
+
+    # Takes TEXT and yields chunks, as opposed to the legacy
+    # tokens-in/one-blob-out contract. TTSService branches on this rather than on
+    # the concrete class, so the worker-backed backend (inference/kokoro_client)
+    # can answer the same question truthfully (self.speak#5 P3).
+    streams_text = True
 
     def __init__(self):
         """Initialize backend with environment-based configuration."""
@@ -64,6 +72,45 @@ class KokoroV1(BaseModelBackend):
             raise e
         except Exception as e:
             raise RuntimeError(f"Failed to load Kokoro model: {e}")
+
+    async def generate_from_phonemes(
+        self,
+        phonemes: str,
+        voice_path: str,
+        speed: float = 1.0,
+        lang_code: str = "a",
+    ):
+        """Synthesise directly from Kokoro-format phonemes.
+
+        Exists as a BACKEND METHOD rather than callers poking
+        ``_get_pipeline(...).generate_from_tokens(...)`` themselves. That
+        reach-through was fine while there was only ever one in-process backend
+        and became a functional regression the moment the model moved to a
+        worker (self.speak#7): an internal cannot cross a process boundary, so
+        the whole route died. A method on the contract can be implemented on
+        both sides.
+
+        Returns the raw float32 audio, or raises if the pipeline produced none.
+
+        ``generate_from_tokens`` is SYNCHRONOUS torch work, so it runs on a
+        thread. An ``async def`` wrapping blocking code is still blocking, and
+        this is the same trap the streaming path needed a whole queue-bridging
+        thread to escape -- a single call is the easy case, so there is no
+        excuse for getting it wrong here. Also means the in-process path stops
+        stalling the event loop, which it did before this existed.
+        """
+
+        def _run():
+            for r in self._get_pipeline(lang_code).generate_from_tokens(
+                tokens=phonemes,
+                voice=voice_path,
+                speed=speed,
+            ):
+                if r.audio is not None:
+                    return r.audio.numpy()
+            raise ValueError("No audio generated")
+
+        return await asyncio.to_thread(_run)
 
     def _get_pipeline(self, lang_code: str) -> KPipeline:
         """Get or create pipeline for language code.
@@ -355,6 +402,12 @@ class KokoroV1(BaseModelBackend):
         for pipeline in self._pipelines.values():
             del pipeline
         self._pipelines.clear()
+        # gc.collect() BEFORE empty_cache(): empty_cache() only returns blocks
+        # the caching allocator considers free, and nn.Module graphs (model AND
+        # pipelines) are full of reference cycles that refcounting alone cannot
+        # break. Without this the cache is emptied while every tensor is still
+        # alive and nothing is returned to the driver.
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()

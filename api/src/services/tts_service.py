@@ -14,7 +14,6 @@ from loguru import logger
 
 from ..core.config import settings
 from ..inference.base import AudioChunk
-from ..inference.kokoro_v1 import KokoroV1
 from ..inference.model_manager import get_manager as get_model_manager
 from ..inference.voice_manager import get_manager as get_voice_manager
 from ..inference.vram_lease import track_synthesis
@@ -23,6 +22,25 @@ from .audio import AudioNormalizer, AudioService
 from .streaming_audio_writer import StreamingAudioWriter
 from .text_processing import tokenize
 from .text_processing.text_processor import process_text_chunk, smart_split
+
+
+def _note_dropped_audio(failures: Optional[List[str]], message: str) -> None:
+    """Record audio we failed to produce, in addition to logging it.
+
+    Every drop site in the streaming path used to call ``logger.error`` and
+    carry on. That is why self.speak#6 happened: a generation failure produced
+    a 200 with a valid, playable, silently SHORTER file, and no consumer —
+    assistant device, self.chat, a caller's retry logic — had any way to tell
+    a complete synthesis from a truncated one.
+
+    Logging is for the operator. This list is for the protocol: the stream
+    consults it before writing the container trailer, and refuses to finish
+    cleanly when anything was lost. Callers that only want the old
+    log-and-continue behaviour pass ``None``.
+    """
+    logger.error(message)
+    if failures is not None:
+        failures.append(message)
 
 
 class TTSService:
@@ -60,8 +78,14 @@ class TTSService:
         normalizer: Optional[AudioNormalizer] = None,
         lang_code: Optional[str] = None,
         return_timestamps: Optional[bool] = False,
+        failures: Optional[List[str]] = None,
     ) -> AsyncGenerator[AudioChunk, None]:
-        """Process tokens into audio."""
+        """Process tokens into audio.
+
+        ``failures`` collects any audio this chunk was asked for but could not
+        produce. It is append-only and owned by the caller; see
+        ``_note_dropped_audio``.
+        """
         async with self._chunk_semaphore:
             try:
                 # Handle stream finalization
@@ -92,7 +116,13 @@ class TTSService:
                 backend = self.model_manager.get_backend()
 
                 # Generate audio using pre-warmed model
-                if isinstance(backend, KokoroV1):
+                # Capability, not concrete class. This used to be
+                # `isinstance(backend, KokoroV1)`, which silently means "is the
+                # IN-PROCESS class" -- so a worker-backed backend would have
+                # fallen through to the legacy tokens-in/one-blob-out branch and
+                # produced wrong audio instead of an error. The question is about
+                # the contract (takes text, yields chunks), so ask it directly.
+                if getattr(backend, "streams_text", False):
                     chunk_index = 0
                     # For Kokoro V1, pass text and voice info with lang_code
                     async for chunk_data in self.model_manager.generate(
@@ -117,7 +147,9 @@ class TTSService:
                                 )
                                 yield chunk_data
                             except Exception as e:
-                                logger.error(f"Failed to convert audio: {str(e)}")
+                                _note_dropped_audio(
+                                    failures, f"Failed to convert audio: {str(e)}"
+                                )
                         else:
                             chunk_data = AudioService.trim_audio(
                                 chunk_data, chunk_text, speed, is_last, normalizer
@@ -137,11 +169,15 @@ class TTSService:
                     )
                     
                     if chunk_data.audio is None:
-                        logger.error("Model generated None for audio chunk")
+                        _note_dropped_audio(
+                            failures, "Model generated None for audio chunk"
+                        )
                         return
 
                     if len(chunk_data.audio) == 0:
-                        logger.error("Model generated empty audio chunk")
+                        _note_dropped_audio(
+                            failures, "Model generated empty audio chunk"
+                        )
                         return
 
                     chunk_data.audio*=volume_multiplier
@@ -160,14 +196,20 @@ class TTSService:
                             )
                             yield chunk_data
                         except Exception as e:
-                            logger.error(f"Failed to convert audio: {str(e)}")
+                            _note_dropped_audio(
+                                failures, f"Failed to convert audio: {str(e)}"
+                            )
                     else:
                         trimmed = AudioService.trim_audio(
                             chunk_data, chunk_text, speed, is_last, normalizer
                         )
                         yield trimmed
             except Exception as e:
-                logger.error(f"Failed to process tokens: {str(e)}")
+                # Still swallowed on purpose — one bad chunk must not abort a
+                # long synthesis. What changed is that it is no longer SILENT:
+                # the caller now knows audio is missing and will refuse to
+                # finalize the stream as if it were complete.
+                _note_dropped_audio(failures, f"Failed to process tokens: {str(e)}")
 
     async def _load_voice_from_path(self, path: str, weight: float):
         # Check if the path is None and raise a ValueError if it is not
@@ -441,6 +483,9 @@ class TTSService:
         stream_normalizer = AudioNormalizer()
         chunk_index = 0
         current_offset = 0.0
+        # Audio this request asked for and did not get. Non-empty means the
+        # stream must NOT be finalized as a well-formed file (self.speak#6).
+        failures: List[str] = []
         try:
             # Lazily (re)load the model if a VRAM-lease release unloaded it —
             # otherwise every synthesis after a release 500s "Backend not
@@ -496,7 +541,9 @@ class TTSService:
                         chunk_index += 1  # Count pause as a yielded chunk
 
                     except Exception as e:
-                        logger.error(f"Failed to process pause chunk: {str(e)}")
+                        _note_dropped_audio(
+                            failures, f"Failed to process pause chunk: {str(e)}"
+                        )
                         continue
 
                 elif tokens or chunk_text.strip():  # Process if there are tokens OR non-whitespace text
@@ -517,6 +564,7 @@ class TTSService:
                             normalizer=stream_normalizer,
                             lang_code=pipeline_lang_code,  # Pass lang_code
                             return_timestamps=return_timestamps,
+                            failures=failures,
                         ):
                             if chunk_data.word_timestamps is not None:
                                 for timestamp in chunk_data.word_timestamps:
@@ -541,10 +589,34 @@ class TTSService:
 
                         chunk_index += 1  # Increment chunk index after processing text
                     except Exception as e:
-                        logger.error(
-                            f"Failed to process audio for chunk: '{chunk_text[:100]}...'. Error: {str(e)}"
+                        _note_dropped_audio(
+                            failures,
+                            f"Failed to process audio for chunk: '{chunk_text[:100]}...'. Error: {str(e)}",
                         )
                         continue
+
+            # Refuse to finalize a synthesis that lost audio.
+            #
+            # The HTTP status is committed at the first byte, so a truncated
+            # result cannot be reported as a 4xx/5xx once streaming has begun.
+            # The only in-band signal left is an ABNORMAL END OF BODY: raising
+            # here means no container trailer is written and the chunked
+            # transfer terminates without its final chunk, so the client sees a
+            # broken transfer instead of a well-formed short file.
+            #
+            # Deliberately AFTER the chunk loop, not inside it: a single bad
+            # chunk still does not stop the remaining ones from being produced
+            # and sent. What the caller loses is only the false claim that what
+            # it received was everything it asked for.
+            #
+            # The non-streaming collector path (generate_audio) consumes this
+            # generator before any response is committed, so there the same
+            # raise surfaces as an ordinary 500.
+            if failures:
+                raise RuntimeError(
+                    f"Synthesis incomplete: {len(failures)} chunk(s) produced no audio "
+                    f"({chunk_index} chunk(s) delivered). First failure: {failures[0]}"
+                )
 
             # Only finalize if we successfully processed at least one chunk
             if chunk_index > 0:
@@ -567,7 +639,11 @@ class TTSService:
                         if chunk_data.output is not None:
                             yield chunk_data
                 except Exception as e:
+                    # A failed finalization is the same failure mode as above:
+                    # the bytes already sent have no valid trailer, so swallowing
+                    # this would hand the client a corrupt file under a 200.
                     logger.error(f"Failed to finalize audio stream: {str(e)}")
+                    raise
 
         except Exception as e:
             logger.error(f"Error in phoneme audio generation: {str(e)}")
@@ -655,36 +731,30 @@ class TTSService:
             backend = self.model_manager.get_backend()
             voice_name, voice_path = await self._get_voices_path(voice)
 
-            if isinstance(backend, KokoroV1):
-                # For Kokoro V1, use generate_from_tokens with raw phonemes
-                result = None
-                # Use provided lang_code or determine from voice name
+            # Ask the BACKEND, not its internals. This used to reach into
+            # backend._get_pipeline(...).generate_from_tokens(...), which was
+            # fine while there was only ever one in-process backend and became a
+            # dead route the moment the model moved to a worker (self.speak#7):
+            # an internal cannot cross a process boundary. Both backends now
+            # implement generate_from_phonemes, so this path stops caring where
+            # the model lives.
+            if hasattr(backend, "generate_from_phonemes"):
                 pipeline_lang_code = lang_code if lang_code else voice[:1].lower()
                 logger.info(
                     f"Using lang_code '{pipeline_lang_code}' for voice '{voice_name}' in phoneme pipeline"
                 )
-
                 try:
-                    # Use backend's pipeline management
-                    for r in backend._get_pipeline(
-                        pipeline_lang_code
-                    ).generate_from_tokens(
-                        tokens=phonemes,  # Pass raw phonemes string
-                        voice=voice_path,
-                        speed=speed,
-                    ):
-                        if r.audio is not None:
-                            result = r
-                            break
+                    audio = await backend.generate_from_phonemes(
+                        phonemes, voice_path, speed, pipeline_lang_code
+                    )
                 except Exception as e:
                     logger.error(f"Failed to generate from phonemes: {e}")
-                    raise RuntimeError(f"Phoneme generation failed: {e}")
+                    raise RuntimeError(f"Phoneme generation failed: {e}") from e
 
-                if result is None or result.audio is None:
+                if audio is None or len(audio) == 0:
                     raise ValueError("No audio generated")
 
-                processing_time = time.time() - start_time
-                return result.audio.numpy(), processing_time
+                return audio, time.time() - start_time
             else:
                 raise ValueError(
                     "Phoneme generation only supported with Kokoro V1 backend"

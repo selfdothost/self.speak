@@ -55,6 +55,12 @@ dependencies = [
     "phonemizer-fork>=3.3.2",
     "av>=14.2.0",
     "text2num>=2.5.1",
+    # Context-free card occupancy for the VRAM probe (self.speak#8). NVML is the
+    # only way to read whole-card used/free WITHOUT creating a CUDA primary
+    # context; torch.cuda.mem_get_info() creates one (386 MiB measured on the
+    # deployed 4090) and only process exit gives it back. Same library self.sketch
+    # and self.curator already use for the same reason.
+    "nvidia-ml-py>=12.560.30",
 ]
 
 [project.optional-dependencies]

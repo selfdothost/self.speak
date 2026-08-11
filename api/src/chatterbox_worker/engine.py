@@ -25,6 +25,7 @@ without it the model synthesises its default voice (Phase 1). ``model.sr`` is th
 output sample rate. Weights are MIT (HF ResembleAI/chatterbox).
 """
 
+import gc
 import logging
 import os
 import threading
@@ -96,6 +97,23 @@ class ChatterboxEngine:
             self._model = None
             self._sr = None
             import torch
+
+            # gc.collect() BEFORE empty_cache(), not after and not omitted.
+            #
+            # empty_cache() only returns blocks the caching allocator considers
+            # free, and an nn.Module graph is full of reference cycles — dropping
+            # the last name above does NOT collect it, because CPython's
+            # refcounting cannot break a cycle. Without this line empty_cache()
+            # ran while every tensor was still alive and freed essentially
+            # nothing: the worker sat at 212 MiB reserved with resident=false for
+            # 41h, and /vram-release answered freed_bytes=0 to a broker that had
+            # asked for VRAM. self.sketch's unload path already does exactly this
+            # (unload_all_models -> gc.collect -> soft_empty_cache); this brings
+            # the worker in line with it.
+            #
+            # synchronize() stays AFTER: it waits on in-flight kernels, which is
+            # about correctness of the free, not about what is collectable.
+            gc.collect()
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

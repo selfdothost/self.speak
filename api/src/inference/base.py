@@ -1,5 +1,6 @@
 """Base interface for Kokoro inference."""
 
+import gc
 from abc import ABC, abstractmethod
 from typing import AsyncGenerator, List, Optional, Tuple, Union
 
@@ -122,6 +123,10 @@ class BaseModelBackend(ModelBackend):
         if self._model is not None:
             del self._model
             self._model = None
+            # gc.collect() BEFORE empty_cache() — see kokoro_v1.unload(). A
+            # dropped name is not a collected object when the graph has cycles,
+            # and empty_cache() can only return what is already free.
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()

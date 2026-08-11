@@ -32,7 +32,7 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from . import vram
+from . import reclaim, vram
 from .engine import ChatterboxEngine
 
 logging.basicConfig(level=os.environ.get("CHATTERBOX_LOG_LEVEL", "INFO"))
@@ -185,8 +185,31 @@ async def vram_release(req: ReleaseRequest):
             # Couldn't measure across the free — can't confirm a delta.
             return {"status": "partial", "freed_bytes": 0}
         freed = max(0, int(before) - int(after))
-        status = "released" if freed >= req.target_bytes else "partial"
-        return {"status": status, "freed_bytes": freed}
+        if freed >= req.target_bytes:
+            return {"status": "released", "freed_bytes": freed}
+
+        # Unloading was not enough. What is left that we could still give back is
+        # this process's CUDA PRIMARY CONTEXT (~470 MiB measured on the 4090),
+        # and no torch call frees it -- empty_cache() returns the caching
+        # allocator, never the context. Only exiting does.
+        #
+        # So on a FORCED release we step aside: the entrypoint respawn loop
+        # brings the worker back, and it lazy-loads on the next /synth or /clone.
+        # Deliberately reactive-only, with NO idle timer -- self.speak fronts
+        # assistant devices and the worker staying warm is worth ~470 MiB until
+        # something else actually needs the card. Only a forced release means
+        # something does.
+        #
+        # main/uvicorn is never exited this way: it is the sole liveness path,
+        # so killing it drops the whole TTS API rather than one optional engine.
+        result = {"status": "partial", "freed_bytes": freed}
+        if req.force and reclaim.RELEASE_MAY_EXIT and reclaim.context_held():
+            if reclaim.schedule_exit(
+                f"forced release asked for {int(req.target_bytes)} B, unloading "
+                f"freed {freed} B; the remainder is this process's CUDA context"
+            ):
+                result["exiting"] = True
+        return result
     finally:
         if acquired:
             _synth_lock.release()

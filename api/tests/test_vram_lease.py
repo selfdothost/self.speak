@@ -43,6 +43,16 @@ from api.tests.conftest import mint_test_ticket
 _GB = 1024 * 1024 * 1024
 
 
+def _fake_nvml(used: int, total: int) -> MagicMock:
+    """A stand-in ``pynvml`` for ``patch.dict(sys.modules, ...)``. The real module
+    installs fine under the CPU test extra, but ``nvmlInit()`` needs a driver, so
+    on CI it would always take the fallback branch. Faking it is what lets the
+    context-free path actually run in the suite instead of being skipped."""
+    mod = MagicMock()
+    mod.nvmlDeviceGetMemoryInfo.return_value = MagicMock(used=used, total=total)
+    return mod
+
+
 # ─── T-002: live tri-state torch.cuda VRAM probe ─────────────────────────
 
 
@@ -50,7 +60,7 @@ class TestProbeVramState:
     def test_case_a_gpu_reachable_returns_real_ints(self):
         """(a) GPU reachable & probed → real ints, status='ok' (R1-AC4)."""
         with patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
-             patch.object(vram_lease.torch.cuda, "mem_get_info", return_value=(2 * _GB, 24 * _GB)), \
+             patch.object(vram_lease, "_card_occupancy_no_context", return_value=(22 * _GB, 24 * _GB)), \
              patch.object(vram_lease.torch.cuda, "memory_reserved", return_value=5 * _GB):
             state = probe_vram_state()
         assert state["status"] == "ok"
@@ -61,16 +71,15 @@ class TestProbeVramState:
         # memory_allocated() (self.ai#74 / self.speak#4).
         assert state["held_vram_bytes"] == 5 * _GB
         assert state["total_capacity_bytes"] == 24 * _GB
-        # Card occupancy is a SEPARATE quantity: total - free = 24 - 2 = 22 GiB,
-        # deliberately NOT equal to this consumer's 5 GiB held. Core must never
-        # sum the two.
+        # Card occupancy is a SEPARATE quantity: 22 GiB used of 24, deliberately
+        # NOT equal to this consumer's 5 GiB held. Core must never sum the two.
         assert state["device_used_bytes"] == 22 * _GB
         assert state["device_total_bytes"] == 24 * _GB
 
     def test_case_a_idle_held_is_near_zero_int_not_null(self):
         """(a) idle → held is a real (near-zero) int, NOT null (R1-AC4)."""
         with patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
-             patch.object(vram_lease.torch.cuda, "mem_get_info", return_value=(24 * _GB, 24 * _GB)), \
+             patch.object(vram_lease, "_card_occupancy_no_context", return_value=(0, 24 * _GB)), \
              patch.object(vram_lease.torch.cuda, "memory_reserved", return_value=0):
             state = probe_vram_state()
         assert state["status"] == "ok"
@@ -78,10 +87,10 @@ class TestProbeVramState:
         assert state["held_vram_bytes"] is not None
 
     def test_case_b_probe_raises_returns_null_not_zero(self):
-        """(b) mem_get_info raises → both null, status='unreachable', NEVER 0
+        """(b) the device probe raises → both null, status='unreachable', NEVER 0
         (R1-AC4/AC5). The try/except is load-bearing — a throw must not crash."""
         with patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
-             patch.object(vram_lease.torch.cuda, "mem_get_info", side_effect=RuntimeError("CUDA init failed")), \
+             patch.object(vram_lease, "_card_occupancy_no_context", side_effect=RuntimeError("CUDA init failed")), \
              patch.object(vram_lease.torch.cuda, "memory_reserved", return_value=0):
             state = probe_vram_state()
         assert state["status"] == "unreachable"
@@ -122,12 +131,80 @@ class TestProbeVramState:
         """R1-AC2: two calls with a changed allocation return the changed value —
         never a cached figure."""
         with patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
-             patch.object(vram_lease.torch.cuda, "mem_get_info", return_value=(0, 24 * _GB)), \
+             patch.object(vram_lease, "_card_occupancy_no_context", return_value=(24 * _GB, 24 * _GB)), \
              patch.object(vram_lease.torch.cuda, "memory_reserved", side_effect=[3 * _GB, 7 * _GB]):
             first = probe_vram_state()
             second = probe_vram_state()
         assert first["held_vram_bytes"] == 3 * _GB
         assert second["held_vram_bytes"] == 7 * _GB
+
+
+# ─── self.speak#8: the probe must not occupy the card it measures ────────
+
+
+class TestProbeCreatesNoCudaContext:
+    """``mem_get_info()`` creates this process's CUDA primary context — 386 MiB
+    on the deployed 4090, reclaimed only by process exit. The main process is
+    idle almost always (the model lives in the worker since self.speak#5), so
+    paying it per poll is pure loss, and worse than loss: card memory no consumer
+    reports as releasable ``held`` becomes core's ``unattributed_overhead``, which
+    is subtracted from free AND reclaimable from nobody. It denied a
+    Qwen3-Coder-Next load by 85 MiB (self.ai#126).
+    """
+
+    def test_happy_path_never_calls_mem_get_info(self):
+        """The whole point: a reachable probe must not touch the one API that
+        creates a context. Guards the regression at the call site, not the
+        helper — patching ``_card_occupancy_no_context`` in the tests above would
+        hide a reintroduced ``mem_get_info()`` in ``probe_vram_state`` itself."""
+        with patch.dict("sys.modules", {"pynvml": _fake_nvml(22 * _GB, 24 * _GB)}), \
+             patch.object(vram_lease.torch.cuda, "is_available", return_value=True), \
+             patch.object(vram_lease.torch.cuda, "memory_reserved", return_value=0), \
+             patch.object(vram_lease.torch.cuda, "mem_get_info") as spy:
+            state = probe_vram_state()
+        spy.assert_not_called()
+        assert state["status"] == "ok"
+        assert state["device_used_bytes"] == 22 * _GB
+        assert state["device_total_bytes"] == 24 * _GB
+
+    def test_used_and_total_both_come_from_nvml(self):
+        """Both figures from ONE source. ``get_device_properties().total_memory``
+        is cheaper but reports usable global memory, not the framebuffer — 234 MiB
+        below NVML on the deployed 4090. Core derives unattributed overhead by
+        subtracting used from total, so a mixed pair would manufacture exactly that
+        much phantom overhead."""
+        fake = _fake_nvml(3 * _GB, 24 * _GB)
+        props = MagicMock(total_memory=23 * _GB)  # deliberately disagrees
+        with patch.dict("sys.modules", {"pynvml": fake}), \
+             patch.object(vram_lease.torch.cuda, "get_device_properties", return_value=props):
+            used, total = vram_lease._card_occupancy_no_context()
+        assert (used, total) == (3 * _GB, 24 * _GB)
+        assert total != props.total_memory
+        fake.nvmlInit.assert_called_once()
+        # Always shut down, so repeated polls cannot leak the handle.
+        fake.nvmlShutdown.assert_called_once()
+
+    def test_falls_back_to_mem_get_info_when_nvml_is_unavailable(self):
+        """A correct number with a context beats a wrong number without one —
+        the self.sketch precedent. Last resort, never the default. The fallback
+        pair is self-consistent too: one call, one denominator."""
+        with patch.dict("sys.modules", {"pynvml": None}), \
+             patch.object(vram_lease.torch.cuda, "mem_get_info", return_value=(2 * _GB, 24 * _GB)) as spy:
+            used, total = vram_lease._card_occupancy_no_context()
+        spy.assert_called_once()
+        assert (used, total) == (22 * _GB, 24 * _GB)
+
+    def test_unreadable_device_raises_so_caller_reports_unreachable(self):
+        """Never invent a figure: with NVML gone AND the device unreadable, the
+        exception must propagate to ``probe_vram_state``'s case-(b) handler
+        rather than resolving to a made-up or zero pair."""
+        with patch.dict("sys.modules", {"pynvml": None}), \
+             patch.object(
+                 vram_lease.torch.cuda, "mem_get_info",
+                 side_effect=RuntimeError("CUDA init failed"),
+             ):
+            with pytest.raises(RuntimeError):
+                vram_lease._card_occupancy_no_context()
 
 
 # ─── T-003 / T-004: wire models ──────────────────────────────────────────

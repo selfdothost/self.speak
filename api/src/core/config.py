@@ -53,6 +53,21 @@ class Settings(BaseSettings):
     chatterbox_control_url: str = (
         "http://127.0.0.1:8881"  # worker's localhost control API (env: CHATTERBOX_CONTROL_URL)
     )
+
+    # Kokoro WORKER cutover (self.speak#5 P3). When True, main proxies every
+    # generation to the sibling worker and never imports kokoro or allocates on
+    # the GPU -- which is the entire point: main is the pod's sole liveness path,
+    # so it can never exit, so its ~470 MiB CUDA primary context was permanently
+    # unreclaimable. Moving generation out means main never creates one.
+    #
+    # MUST be set together with KOKORO_WORKER_ENABLED on the entrypoint. They are
+    # ONE switch in two places: entrypoint-only gives you TWO contexts (worker +
+    # main) and is strictly worse than before, while this-only gives you a main
+    # proxying to a worker nobody started.
+    kokoro_worker_enabled: bool = False
+    kokoro_worker_url: str = (
+        "http://127.0.0.1:8882"  # worker's localhost API (env: KOKORO_WORKER_URL)
+    )
     chatterbox_voices_dir: str = (
         "/app/api/src/chatterbox_voices"  # reference-clip staging (clone route, Phase 3)
     )
